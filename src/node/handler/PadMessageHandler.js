@@ -932,7 +932,7 @@ async function handleClientReady(client, message)
   await Promise.all(authors.map(authorId => {
     return authorManager.getAuthor(authorId).then(author => {
       if (!author) {
-        messageLogger.error("There is no author for authorId:", authorId);
+        messageLogger.error("There is no author for authorId: ", authorId, ". This is possibly related to https://github.com/ether/etherpad-lite/issues/2802");
       } else {
         historicalAuthorData[authorId] = { name: author.name, colorId: author.colorId }; // Filter author attribs (e.g. don't send author's pads to all clients)
       }
@@ -1065,6 +1065,7 @@ async function handleClientReady(client, message)
     // mile wide...
     var clientVars = {
       "skinName": settings.skinName,
+      "skinVariants": settings.skinVariants,
       "accountPrivs": {
           "maxRevisions": 100
       },
@@ -1189,6 +1190,28 @@ async function handleClientReady(client, message)
       let p = cached ? Promise.resolve(cached) : authorManager.getAuthor(author);
 
       return p.then(authorInfo => {
+        // default fallback color to use if authorInfo.colorId is null
+        const defaultColor = "#daf0b2";
+
+        if (!authorInfo) {
+          console.warn(`handleClientReady(): no authorInfo parameter was received. Default values are going to be used. See issue #3612.  This can be caused by a user clicking undo after clearing all authorship colors see #2802`);
+          authorInfo = {};
+        }
+
+        // For some reason sometimes name isn't set
+        // Catch this issue here and use a fixed name.
+        if (!authorInfo.name) {
+          console.warn(`handleClientReady(): client submitted no author name. Using "Anonymous". See: issue #3612`);
+          authorInfo.name = "Anonymous";
+        }
+
+        // For some reason sometimes colorId isn't set
+        // Catch this issue here and use a fixed color.
+        if (!authorInfo.colorId) {
+          console.warn(`handleClientReady(): author "${authorInfo.name}" has no property colorId. Using the default color ${defaultColor}. See issue #3612`);
+          authorInfo.colorId = defaultColor;
+        }
+
         // Send the new User a Notification about this other user
         let msg = {
           "type": "COLLABROOM",
@@ -1407,11 +1430,12 @@ async function composePadChangesets (padId, startNum, endNum)
   }));
 
   // compose Changesets
+  let r;
   try {
     let changeset = changesets[startNum];
     let pool = pad.apool();
 
-    for (let r = startNum + 1; r < endNum; r++) {
+    for (r = startNum + 1; r < endNum; r++) {
       let cs = changesets[r];
       changeset = Changeset.compose(changeset, cs, pool);
     }

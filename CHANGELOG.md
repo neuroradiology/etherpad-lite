@@ -1,3 +1,30 @@
+# 1.8.3
+* REQUIREMENTS: minimum required Node version is **10.13.0 LTS**.
+
+*BREAKING CHANGE*: undoing the "clear authorship colors" command is no longer supported (see https://github.com/ether/etherpad-lite/issues/2802)
+
+# 1.8
+* SECURITY: change referrer policy so that Etherpad addresses aren't leaked when links are clicked (discussion: https://github.com/ether/etherpad-lite/pull/3636)
+* SECURITY: set the "secure" flag for the session cookies when served over SSL. From now on it will not be possible to serve the same instance both in cleartext and over SSL
+
+# 1.8-beta.1
+* FEATURE: code was migrated to `async`/`await`, getting rid of a lot of callbacks (see https://github.com/ether/etherpad-lite/issues/3540)
+* FEATURE: support configuration via environment variables
+* FEATURE: include an official Dockerfile in the main repository
+* FEATURE: support including plugins in custom Docker builds
+* FEATURE: conditional creation of users: when its password is null, a user is not created. This helps, for example, in advanced configuration of Docker images.
+* REQUIREMENTS: minimum required Node version is **8.9.0 LTS**. Release 1.8.3 will require at least Node **10.13.0** LTS
+* MINOR: in the HTTP API, allow URL parameters and POST bodies to co-exist
+* MINOR: fix Unicode bug in HTML export
+* MINOR: bugfixes to colibris chat window
+* MINOR: code simplification (avoided double negations, introduced early exits, ...)
+* MINOR: reduced the size of the Windows package
+* MINOR: upgraded the nodejs runtime to 10.16.3 in the Windows package
+* SECURITY: avoided XSS in IE11
+* SECURITY: the version is exposed in http header only when configured
+* SECURITY: updated vendored jQuery version
+* SECURITY: bumped dependencies
+
 # 1.7.5
 * FEATURE: introduced support for multiple skins. See https://etherpad.org/doc/v1.7.5/#index_skins
 * FEATURE: added a new, optional skin. It can be activated choosing `skinName: "colibris"` in `settings.json`

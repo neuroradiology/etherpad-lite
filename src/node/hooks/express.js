@@ -18,7 +18,13 @@ exports.createServer = function () {
 
   exports.restartServer();
 
-  console.log(`You can access your Etherpad instance at http://${settings.ip}:${settings.port}/`);
+  if (settings.ip === "") {
+    // using Unix socket for connectivity
+    console.log(`You can access your Etherpad instance using the Unix socket at ${settings.port}`);
+  } else {
+    console.log(`You can access your Etherpad instance at http://${settings.ip}:${settings.port}/`);
+  }
+
   if (!_.isEmpty(settings.users)) {
     console.log(`The plugin admin page is at http://${settings.ip}:${settings.port}/admin/plugins`);
   } else {
@@ -76,6 +82,15 @@ exports.restartServer = function () {
     // https://github.com/ether/etherpad-lite/issues/2547
     res.header("X-UA-Compatible", "IE=Edge,chrome=1");
 
+    // Enable a strong referrer policy. Same-origin won't drop Referers when
+    // loading local resources, but it will drop them when loading foreign resources.
+    // It's still a last bastion of referrer security. External URLs should be
+    // already marked with rel="noreferer" and user-generated content pages are already
+    // marked with <meta name="referrer" content="no-referrer">
+    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Referrer-Policy
+    // https://github.com/ether/etherpad-lite/pull/3636
+    res.header("Referrer-Policy", "same-origin");
+
     // send git version in the Server response header if exposeVersion is true.
     if (settings.exposeVersion) {
       res.header("Server", serverName);
@@ -85,6 +100,12 @@ exports.restartServer = function () {
   });
 
   if (settings.trustProxy) {
+    /*
+     * If 'trust proxy' === true, the client’s IP address in req.ip will be the
+     * left-most entry in the X-Forwarded-* header.
+     *
+     * Source: https://expressjs.com/en/guide/behind-proxies.html
+     */
     app.enable('trust proxy');
   }
 

@@ -2,19 +2,19 @@
 	"@metadata": {
 		"authors": [
 			"Artnay",
+			"Espeox",
 			"Jl",
 			"Lliehu",
+			"Macofe",
+			"MrTapsa",
 			"Nedergard",
 			"Nike",
+			"Pyscowicz",
+			"Silvonen",
 			"Stryn",
 			"Tomi Toivio",
 			"Veikk0.ma",
-			"VezonThunder",
-			"Macofe",
-			"MrTapsa",
-			"Silvonen",
-			"Espeox",
-			"Pyscowicz"
+			"VezonThunder"
 		]
 	},
 	"index.newPad": "Uusi muistio",
@@ -99,6 +99,8 @@
 	"pad.chat": "Keskustelu",
 	"pad.chat.title": "Avaa keskustelu nykyisestä muistiosta.",
 	"pad.chat.loadmessages": "Lataa lisää viestejä",
+	"pad.chat.stick.title": "Liimaa chatti ruutuun",
+	"pad.chat.writeMessage.placeholder": "Kirjoita viestisi tähän",
 	"timeslider.pageTitle": "{{appTitle}} -aikajana",
 	"timeslider.toolbar.returnbutton": "Palaa muistioon",
 	"timeslider.toolbar.authors": "Tekijät:",
