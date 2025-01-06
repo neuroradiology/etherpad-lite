@@ -24,6 +24,31 @@
  *
  * This is useful, for example, when running in a Docker container.
  *
+ * DETAILED RULES:
+ *   - If the environment variable is set to the string "true" or "false", the
+ *     value becomes Boolean true or false.
+ *   - If the environment variable is set to the string "null", the value
+ *     becomes null.
+ *   - If the environment variable is set to the string "undefined", the setting
+ *     is removed entirely, except when used as the member of an array in which
+ *     case it becomes null.
+ *   - If the environment variable is set to a string representation of a finite
+ *     number, the string is converted to that number.
+ *   - If the environment variable is set to any other string, including the
+ *     empty string, the value is that string.
+ *   - If the environment variable is unset and a default value is provided, the
+ *     value is as if the environment variable was set to the provided default:
+ *       - "${UNSET_VAR:}" becomes the empty string.
+ *       - "${UNSET_VAR:foo}" becomes the string "foo".
+ *       - "${UNSET_VAR:true}" and "${UNSET_VAR:false}" become true and false.
+ *       - "${UNSET_VAR:null}" becomes null.
+ *       - "${UNSET_VAR:undefined}" causes the setting to be removed (or be set
+ *         to null, if used as a member of an array).
+ *   - If the environment variable is unset and no default value is provided,
+ *     the value becomes null. THIS BEHAVIOR MAY CHANGE IN A FUTURE VERSION OF
+ *     ETHERPAD; if you want the default value to be null, you should explicitly
+ *     specify "null" as the default value.
+ *
  * EXAMPLE:
  *    "port":     "${PORT:9001}"
  *    "minify":   "${MINIFY}"
@@ -65,6 +90,9 @@
  *    "password": "${PASSW}"  // if PASSW is not defined would result in password === null
  *    "password": "${PASSW:}" // if PASSW is not defined would result in password === ''
  *
+ *    If you want to use an empty value (null) as default value for a variable,
+ *    simply do not set it, without putting any colons: "${ABIWORD}".
+ *
  * 3) if you want to use newlines in the default value of a string parameter,
  *    use "\n" as usual.
  *
@@ -77,10 +105,12 @@
   "title": "${TITLE:Etherpad}",
 
   /*
-   * favicon default name
-   * alternatively, set up a fully specified Url to your own favicon
+   * Pathname of the favicon you want to use. If null, the skin's favicon is
+   * used if one is provided by the skin, otherwise the default Etherpad favicon
+   * is used. If this is a relative path it is interpreted as relative to the
+   * Etherpad root directory.
    */
-  "favicon": "${FAVICON:favicon.ico}",
+  "favicon": "${FAVICON:null}",
 
   /*
    * Skin name.
@@ -119,7 +149,7 @@
    * "full-width-editor" variant (by default editor is rendered as a page, with
    * a max-width of 900px).
    */
-  "skinVariants": "super-light-toolbar super-light-editor light-background",
+  "skinVariants": "${SKIN_VARIANTS:super-light-toolbar super-light-editor light-background}",
 
   /*
    * IP and port which Etherpad should bind at.
@@ -142,6 +172,21 @@
   "showSettingsInAdminPage": "${SHOW_SETTINGS_IN_ADMIN_PAGE:true}",
 
   /*
+   * Settings for cleanup of pads
+   */
+  "cleanup": {
+    "enabled": false,
+    "keepRevisions": 5
+  },
+
+  /*
+    The authentication method used by the server.
+    The default value is sso
+    If you want to use the old authentication system, change this to apikey
+   */
+  "authenticationMethod": "${AUTHENTICATION_METHOD:sso}",
+
+  /*
    * Node native SSL support
    *
    * This is disabled by default.
@@ -157,6 +202,15 @@
           },
   */
 
+
+  /*
+   * Enables the use of a different server. We have a different one that syncs changes from the original server.
+   * It is hosted on GitHub and should not be blocked by many firewalls.
+   *  https://etherpad.org/ep_infos
+   */
+
+  "updateServer": "https://etherpad.org/ep_infos",
+
   /*
    * The type of the database.
    *
@@ -168,7 +222,7 @@
    *
    *
    * Database specific settings are dependent on dbType, and go in dbSettings.
-   * Remember that since Etherpad 1.6.0 you can also store these informations in
+   * Remember that since Etherpad 1.6.0 you can also store this information in
    * credentials.json.
    *
    * For a complete list of the supported drivers, please refer to:
@@ -177,13 +231,15 @@
 
   "dbType": "${DB_TYPE:dirty}",
   "dbSettings": {
-    "host":     "${DB_HOST}",
-    "port":     "${DB_PORT}",
-    "database": "${DB_NAME}",
-    "user":     "${DB_USER}",
-    "password": "${DB_PASS}",
-    "charset":  "${DB_CHARSET}",
-    "filename": "${DB_FILENAME:var/dirty.db}"
+    "host":       "${DB_HOST:undefined}",
+    "port":       "${DB_PORT:undefined}",
+    "database":   "${DB_NAME:undefined}",
+    "user":       "${DB_USER:undefined}",
+    "password":   "${DB_PASS:undefined}",
+    "charset":    "${DB_CHARSET:undefined}",
+    "filename":   "${DB_FILENAME:var/dirty.db}",
+    "collection": "${DB_COLLECTION:undefined}",
+    "url":        "${DB_URL:undefined}"
   },
 
   /*
@@ -197,57 +253,57 @@
    * Change them if you want to override.
    */
   "padOptions": {
-    "noColors":         false,
-    "showControls":     true,
-    "showChat":         true,
-    "showLineNumbers":  true,
-    "useMonospaceFont": false,
-    "userName":         false,
-    "userColor":        false,
-    "rtl":              false,
-    "alwaysShowChat":   false,
-    "chatAndUsers":     false,
-    "lang":             "en-gb"
+    "noColors":         "${PAD_OPTIONS_NO_COLORS:false}",
+    "showControls":     "${PAD_OPTIONS_SHOW_CONTROLS:true}",
+    "showChat":         "${PAD_OPTIONS_SHOW_CHAT:true}",
+    "showLineNumbers":  "${PAD_OPTIONS_SHOW_LINE_NUMBERS:true}",
+    "useMonospaceFont": "${PAD_OPTIONS_USE_MONOSPACE_FONT:false}",
+    "userName":         "${PAD_OPTIONS_USER_NAME:null}",
+    "userColor":        "${PAD_OPTIONS_USER_COLOR:null}",
+    "rtl":              "${PAD_OPTIONS_RTL:false}",
+    "alwaysShowChat":   "${PAD_OPTIONS_ALWAYS_SHOW_CHAT:false}",
+    "chatAndUsers":     "${PAD_OPTIONS_CHAT_AND_USERS:false}",
+    "lang":             "${PAD_OPTIONS_LANG:null}"
   },
 
   /*
    * Pad Shortcut Keys
    */
   "padShortcutEnabled" : {
-    "altF9":     true, /* focus on the File Menu and/or editbar */
-    "altC":      true, /* focus on the Chat window */
-    "cmdShift2": true, /* shows a gritter popup showing a line author */
-    "delete":    true,
-    "return":    true,
-    "esc":       true, /* in mozilla versions 14-19 avoid reconnecting pad */
-    "cmdS":      true, /* save a revision */
-    "tab":       true, /* indent */
-    "cmdZ":      true, /* undo/redo */
-    "cmdY":      true, /* redo */
-    "cmdI":      true, /* italic */
-    "cmdB":      true, /* bold */
-    "cmdU":      true, /* underline */
-    "cmd5":      true, /* strike through */
-    "cmdShiftL": true, /* unordered list */
-    "cmdShiftN": true, /* ordered list */
-    "cmdShift1": true, /* ordered list */
-    "cmdShiftC": true, /* clear authorship */
-    "cmdH":      true, /* backspace */
-    "ctrlHome":  true, /* scroll to top of pad */
-    "pageUp":    true,
-    "pageDown":  true
+    "altF9":     "${PAD_SHORTCUTS_ENABLED_ALT_F9:true}",      /* focus on the File Menu and/or editbar */
+    "altC":      "${PAD_SHORTCUTS_ENABLED_ALT_C:true}",       /* focus on the Chat window */
+    "cmdShift2": "${PAD_SHORTCUTS_ENABLED_CMD_SHIFT_2:true}", /* shows a gritter popup showing a line author */
+    "delete":    "${PAD_SHORTCUTS_ENABLED_DELETE:true}",
+    "return":    "${PAD_SHORTCUTS_ENABLED_RETURN:true}",
+    "esc":       "${PAD_SHORTCUTS_ENABLED_ESC:true}",         /* in mozilla versions 14-19 avoid reconnecting pad */
+    "cmdS":      "${PAD_SHORTCUTS_ENABLED_CMD_S:true}",       /* save a revision */
+    "tab":       "${PAD_SHORTCUTS_ENABLED_TAB:true}",         /* indent */
+    "cmdZ":      "${PAD_SHORTCUTS_ENABLED_CMD_Z:true}",       /* undo/redo */
+    "cmdY":      "${PAD_SHORTCUTS_ENABLED_CMD_Y:true}",       /* redo */
+    "cmdI":      "${PAD_SHORTCUTS_ENABLED_CMD_I:true}",       /* italic */
+    "cmdB":      "${PAD_SHORTCUTS_ENABLED_CMD_B:true}",       /* bold */
+    "cmdU":      "${PAD_SHORTCUTS_ENABLED_CMD_U:true}",       /* underline */
+    "cmd5":      "${PAD_SHORTCUTS_ENABLED_CMD_5:true}",       /* strike through */
+    "cmdShiftL": "${PAD_SHORTCUTS_ENABLED_CMD_SHIFT_L:true}", /* unordered list */
+    "cmdShiftN": "${PAD_SHORTCUTS_ENABLED_CMD_SHIFT_N:true}", /* ordered list */
+    "cmdShift1": "${PAD_SHORTCUTS_ENABLED_CMD_SHIFT_1:true}", /* ordered list */
+    "cmdShiftC": "${PAD_SHORTCUTS_ENABLED_CMD_SHIFT_C:true}", /* clear authorship */
+    "cmdH":      "${PAD_SHORTCUTS_ENABLED_CMD_H:true}",       /* backspace */
+    "ctrlHome":  "${PAD_SHORTCUTS_ENABLED_CTRL_HOME:true}",   /* scroll to top of pad */
+    "pageUp":    "${PAD_SHORTCUTS_ENABLED_PAGE_UP:true}",
+    "pageDown":  "${PAD_SHORTCUTS_ENABLED_PAGE_DOWN:true}"
   },
 
   /*
    * Should we suppress errors from being visible in the default Pad Text?
    */
-  "suppressErrorsInPadText": false,
+  "suppressErrorsInPadText": "${SUPPRESS_ERRORS_IN_PAD_TEXT:false}",
 
   /*
    * If this option is enabled, a user must have a session to access pads.
    * This effectively allows only group pads to be accessed.
    */
-  "requireSession": false,
+  "requireSession": "${REQUIRE_SESSION:false}",
 
   /*
    * Users may edit pads but not create new ones.
@@ -255,13 +311,7 @@
    * Pad creation is only via the API.
    * This applies both to group pads and regular pads.
    */
-  "editOnly": false,
-
-  /*
-   * If set to true, those users who have a valid session will automatically be
-   * granted access to password protected pads.
-   */
-  "sessionNoPassword": false,
+  "editOnly": "${EDIT_ONLY:false}",
 
   /*
    * If true, all css & js will be minified before sending to the client.
@@ -269,7 +319,7 @@
    * This will improve the loading performance massively, but makes it difficult
    * to debug the javascript/css
    */
-  "minify": true,
+  "minify": "${MINIFY:true}",
 
   /*
    * How long may clients use served javascript code (in seconds)?
@@ -277,7 +327,7 @@
    * Not setting this may cause problems during deployment.
    * Set to 0 to disable caching.
    */
-  "maxAge": 21600, // 60 * 60 * 6 = 6 hours
+  "maxAge": "${MAX_AGE:21600}", // 60 * 60 * 6 = 6 hours
 
   /*
    * Absolute path to the Abiword executable.
@@ -286,7 +336,7 @@
    * it to null disables Abiword and will only allow plain text and HTML
    * import/exports.
    */
-  "abiword": null,
+  "abiword": "${ABIWORD:null}",
 
   /*
    * This is the absolute path to the soffice executable.
@@ -294,33 +344,25 @@
    * LibreOffice can be used in lieu of Abiword to export pads.
    * Setting it to null disables LibreOffice exporting.
    */
-  "soffice": null,
-
-  /*
-   * Path to the Tidy executable.
-   *
-   * Tidy is used to improve the quality of exported pads.
-   * Setting it to null disables Tidy.
-   */
-  "tidyHtml": null,
+  "soffice": "${SOFFICE:null}",
 
   /*
    * Allow import of file types other than the supported ones:
    * txt, doc, docx, rtf, odt, html & htm
    */
-  "allowUnknownFileEnds": true,
+  "allowUnknownFileEnds": "${ALLOW_UNKNOWN_FILE_ENDS:true}",
 
   /*
    * This setting is used if you require authentication of all users.
    *
    * Note: "/admin" always requires authentication.
    */
-  "requireAuthentication": false,
+  "requireAuthentication": "${REQUIRE_AUTHENTICATION:false}",
 
   /*
    * Require authorization by a module, or a user with is_admin set, see below.
    */
-  "requireAuthorization": false,
+  "requireAuthorization": "${REQUIRE_AUTHORIZATION:false}",
 
   /*
    * When you use NGINX or another proxy/load-balancer set this to true.
@@ -334,9 +376,90 @@
   "trustProxy": "${TRUST_PROXY:false}",
 
   /*
+   * Settings controlling the session cookie issued by Etherpad.
+   */
+  "cookie": {
+    /*
+     * How often (in milliseconds) the key used to sign the express_sid cookie
+     * should be rotated. Long rotation intervals reduce signature verification
+     * overhead (because there are fewer historical keys to check) and database
+     * load (fewer historical keys to store, and less frequent queries to
+     * get/update the keys). Short rotation intervals are slightly more secure.
+     *
+     * Multiple Etherpad processes sharing the same database (table) is
+     * supported as long as the clock sync error is significantly less than this
+     * value.
+     *
+     * Key rotation can be disabled (not recommended) by setting this to 0 or
+     * null, or by disabling session expiration (see sessionLifetime).
+     */
+    // 86400000 = 1d * 24h/d * 60m/h * 60s/m * 1000ms/s
+    "keyRotationInterval": "${COOKIE_KEY_ROTATION_INTERVAL:86400000}",
+
+    /*
+     * Value of the SameSite cookie property. "Lax" is recommended unless
+     * Etherpad will be embedded in an iframe from another site, in which case
+     * this must be set to "None". Note: "None" will not work (the browser will
+     * not send the cookie to Etherpad) unless https is used to access Etherpad
+     * (either directly or via a reverse proxy with "trustProxy" set to true).
+     *
+     * "Strict" is not recommended because it has few security benefits but
+     * significant usability drawbacks vs. "Lax". See
+     * https://stackoverflow.com/q/41841880 for discussion.
+     */
+    "sameSite": "${COOKIE_SAME_SITE:Lax}",
+
+    /*
+     * How long (in milliseconds) after navigating away from Etherpad before the
+     * user is required to log in again. (The express_sid cookie is set to
+     * expire at time now + sessionLifetime when first created, and its
+     * expiration time is periodically refreshed to a new now + sessionLifetime
+     * value.) If requireAuthentication is false then this value does not really
+     * matter.
+     *
+     * The "best" value depends on your users' usage patterns and the amount of
+     * convenience you desire. A long lifetime is more convenient (users won't
+     * have to log back in as often) but has some drawbacks:
+     *   - It increases the amount of state kept in the database.
+     *   - It might weaken security somewhat: The cookie expiration is refreshed
+     *     indefinitely without consulting authentication or authorization
+     *     hooks, so once a user has accessed a pad, the user can continue to
+     *     use the pad until the user leaves for longer than sessionLifetime.
+     *   - More historical keys (sessionLifetime / keyRotationInterval) must be
+     *     checked when verifying signatures.
+     *
+     * Session lifetime can be set to infinity (not recommended) by setting this
+     * to null or 0. Note that if the session does not expire, most browsers
+     * will delete the cookie when the browser exits, but a session record is
+     * kept in the database forever.
+     */
+    // 864000000 = 10d * 24h/d * 60m/h * 60s/m * 1000ms/s
+    "sessionLifetime": "${COOKIE_SESSION_LIFETIME:864000000}",
+
+    /*
+     * How long (in milliseconds) before the expiration time of an active user's
+     * session is refreshed (to now + sessionLifetime). This setting affects the
+     * following:
+     *   - How often a new session expiration time will be written to the
+     *     database.
+     *   - How often each user's browser will ping the Etherpad server to
+     *     refresh the expiration time of the session cookie.
+     *
+     * High values reduce the load on the database and the load from browsers,
+     * but can shorten the effective session lifetime if Etherpad is restarted
+     * or the user navigates away.
+     *
+     * Automatic session refreshes can be disabled (not recommended) by setting
+     * this to null.
+     */
+    // 86400000 = 1d * 24h/d * 60m/h * 60s/m * 1000ms/s
+    "sessionRefreshInterval": "${COOKIE_SESSION_REFRESH_INTERVAL:86400000}"
+  },
+
+  /*
    * Privacy: disable IP logging
    */
-  "disableIPlogging": false,
+  "disableIPlogging": "${DISABLE_IP_LOGGING:false}",
 
   /*
    * Time (in seconds) to automatically reconnect pad when a "Force reconnect"
@@ -344,7 +467,7 @@
    *
    * Set to 0 to disable automatic reconnection.
    */
-  "automaticReconnectionTimeout": 0,
+  "automaticReconnectionTimeout": "${AUTOMATIC_RECONNECTION_TIMEOUT:0}",
 
   /*
    * By default, when caret is moved out of viewport, it scrolls the minimum
@@ -362,21 +485,21 @@
      * Set to 0 to disable extra scrolling
      */
     "percentage": {
-      "editionAboveViewport": 0,
-      "editionBelowViewport": 0
+      "editionAboveViewport": "${FOCUS_LINE_PERCENTAGE_ABOVE:0}",
+      "editionBelowViewport": "${FOCUS_LINE_PERCENTAGE_BELOW:0}"
     },
 
     /*
      * Time (in milliseconds) used to animate the scroll transition.
      * Set to 0 to disable animation
      */
-    "duration": 0,
+    "duration": "${FOCUS_LINE_DURATION:0}",
 
     /*
      * Flag to control if it should scroll when user places the caret in the
      * last line of the viewport
      */
-    "scrollWhenCaretIsInTheLastLineOfViewport": false,
+    "scrollWhenCaretIsInTheLastLineOfViewport": "${FOCUS_LINE_CARET_SCROLL:false}",
 
     /*
      * Percentage of viewport height to be additionally scrolled when user
@@ -384,14 +507,26 @@
      *
      * Set to 0 to let the scroll to be handled as default by Etherpad
      */
-    "percentageToScrollWhenUserPressesArrowUp": 0
+    "percentageToScrollWhenUserPressesArrowUp": "${FOCUS_LINE_PERCENTAGE_ARROW_UP:0}"
   },
 
   /*
-   * Users for basic authentication.
+   * User accounts. These accounts are used by:
+   *   - default HTTP basic authentication if no plugin handles authentication
+   *   - some but not all authentication plugins
+   *   - some but not all authorization plugins
    *
-   * is_admin = true gives access to /admin.
-   * If you do not uncomment this, /admin will not be available!
+   * User properties:
+   *   - password: The user's password. Some authentication plugins will ignore
+   *     this.
+   *   - is_admin: true gives access to /admin. Defaults to false. If you do not
+   *     uncomment this, /admin will not be available!
+   *   - readOnly: If true, this user will not be able to create new pads or
+   *     modify existing pads. Defaults to false.
+   *   - canCreate: If this is true and readOnly is false, this user can create
+   *     new pads. Defaults to true.
+   *
+   * Authentication and authorization plugins may define additional properties.
    *
    * WARNING: passwords should not be stored in plaintext in this file.
    *          If you want to mitigate this, please install ep_hash_auth and
@@ -402,13 +537,13 @@
     "admin": {
       // 1) "password" can be replaced with "hash" if you install ep_hash_auth
       // 2) please note that if password is null, the user will not be created
-      "password": "${ADMIN_PASSWORD}",
+      "password": "${ADMIN_PASSWORD:null}",
       "is_admin": true
     },
     "user": {
       // 1) "password" can be replaced with "hash" if you install ep_hash_auth
       // 2) please note that if password is null, the user will not be created
-      "password": "${USER_PASSWORD}",
+      "password": "${USER_PASSWORD:null}",
       "is_admin": false
     }
   },
@@ -416,14 +551,30 @@
   /*
    * Restrict socket.io transport methods
    */
-  "socketTransportProtocols" : ["xhr-polling", "jsonp-polling", "htmlfile"],
+  "socketTransportProtocols" : ["websocket", "polling"],
+
+  "socketIo": {
+    /*
+     * Maximum permitted client message size (in bytes). All messages from
+     * clients that are larger than this will be rejected. Large values make it
+     * possible to paste large amounts of text, and plugins may require a larger
+     * value to work properly, but increasing the value increases susceptibility
+     * to denial of service attacks (malicious clients can exhaust memory).
+     */
+    "maxHttpBufferSize": "${SOCKETIO_MAX_HTTP_BUFFER_SIZE:50000}"
+  },
 
   /*
    * Allow Load Testing tools to hit the Etherpad Instance.
    *
    * WARNING: this will disable security on the instance.
    */
-  "loadTest": false,
+  "loadTest": "${LOAD_TEST:false}",
+
+  /**
+  * Disable dump of objects preventing a clean exit
+  */
+  "dumpOnUncleanExit": "${DUMP_ON_UNCLEAN_EXIT:false}",
 
   /*
    * Disable indentation on new line when previous line ends with some special
@@ -460,6 +611,22 @@
   "importMaxFileSize": "${IMPORT_MAX_FILE_SIZE:52428800}", // 50 * 1024 * 1024
 
   /*
+   * From Etherpad 1.8.5 onwards, when Etherpad is in production mode commits from individual users are rate limited
+   *
+   * The default is to allow at most 10 changes per IP in a 1 second window.
+   * After that the change is rejected.
+   *
+   * See https://github.com/animir/node-rate-limiter-flexible/wiki/Overall-example#websocket-single-connection-prevent-flooding for more options
+   */
+  "commitRateLimiting": {
+    // duration of the rate limit window (seconds)
+    "duration": "${COMMIT_RATE_LIMIT_DURATION:1}",
+
+    // maximum number of changes per IP to allow during the rate limit window
+    "points": "${COMMIT_RATE_LIMIT_POINTS:10}"
+  },
+
+  /*
    * Toolbar buttons configuration.
    *
    * Uncomment to customize.
@@ -489,7 +656,7 @@
    *
    * Do not enable on production machines.
    */
-  "exposeVersion": false,
+  "exposeVersion": "${EXPOSE_VERSION:false}",
 
   /*
    * The log level we are using.
@@ -498,55 +665,44 @@
    */
   "loglevel": "${LOGLEVEL:INFO}",
 
+  /* Override any strings found in locale directories */
+  "customLocaleStrings": {},
+
+  /* Disable Admin UI tests */
+  "enableAdminUITests": false,
+
   /*
-   * Logging configuration. See log4js documentation for further information:
-   * https://github.com/nomiddlename/log4js-node
-   *
-   * You can add as many appenders as you want here.
+   * Enable/Disable case-insensitive pad names.
    */
-  "logconfig" :
-    { "appenders": [
-        { "type": "console"
-        //, "category": "access"// only logs pad access
+  "lowerCasePadIds": "${LOWER_CASE_PAD_IDS:false}",
+  "sso": {
+    "issuer": "${SSO_ISSUER:http://localhost:9001}",
+      "clients": [
+        {
+          "client_id": "${ADMIN_CLIENT:admin_client}",
+          "client_secret": "${ADMIN_SECRET:admin}",
+          "grant_types": ["authorization_code"],
+          "response_types": ["code"],
+          "redirect_uris": ["${ADMIN_REDIRECT:http://localhost:9001/admin/}"]
+        },
+        {
+          "client_id": "${USER_CLIENT:user_client}",
+          "client_secret": "${USER_SECRET:user}",
+          "grant_types": ["authorization_code"],
+          "response_types": ["code"],
+          "redirect_uris": ["${USER_REDIRECT:http://localhost:9001/}"]
         }
-
-      /*
-      , { "type": "file"
-      , "filename": "your-log-file-here.log"
-      , "maxLogSize": 1024
-      , "backups": 3 // how many log files there're gonna be at max
-      //, "category": "test" // only log a specific category
-        }
-      */
-
-      /*
-      , { "type": "logLevelFilter"
-        , "level": "warn" // filters out all log messages that have a lower level than "error"
-        , "appender":
-          {  Use whatever appender you want here  }
-        }
-      */
-
-      /*
-      , { "type": "logLevelFilter"
-        , "level": "error" // filters out all log messages that have a lower level than "error"
-        , "appender":
-          { "type": "smtp"
-          , "subject": "An error occurred in your EPL instance!"
-          , "recipients": "bar@blurdybloop.com, baz@blurdybloop.com"
-          , "sendInterval": 300 // 60 * 5 = 5 minutes -- will buffer log messages; set to 0 to send a mail for every message
-          , "transport": "SMTP", "SMTP": { // see https://github.com/andris9/Nodemailer#possible-transport-methods
-              "host": "smtp.example.com", "port": 465,
-              "secureConnection": true,
-              "auth": {
-                  "user": "foo@example.com",
-                  "pass": "bar_foo"
-              }
-            }
-          }
-        }
-      */
-
       ]
-    } // logconfig
+    },
+
+  /* Set the time to live for the tokens
+     This is the time of seconds a user is logged into Etherpad
+  "ttl": {
+      "AccessToken": 3600,
+      "AuthorizationCode": 600,
+      "ClientCredentials": 3600,
+      "IdToken": 3600,
+      "RefreshToken": 86400
+  }
+  */
 }

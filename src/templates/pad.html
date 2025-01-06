@@ -1,16 +1,16 @@
 <%
   var settings = require("ep_etherpad-lite/node/utils/Settings")
-    , hooks = require('ep_etherpad-lite/static/js/pluginfw/hooks')
     , langs = require("ep_etherpad-lite/node/hooks/i18n").availableLangs
+    , pluginUtils = require('ep_etherpad-lite/static/js/pluginfw/shared')
     ;
 %>
 <!doctype html>
-
-<% e.begin_block("htmlHead"); %>
-<html class="<%=hooks.clientPluginNames().join(' '); %> <%=settings.skinVariants%>">
-<% e.end_block(); %>
-
+<html translate="no" class="pad <%=pluginUtils.clientPluginNames().join(' '); %> <%=settings.skinVariants%>">
+<head>
+  <% e.begin_block("htmlHead"); %>
+  <% e.end_block(); %>
   <title><%=settings.title%></title>
+  <link rel="manifest" href="../../manifest.json" />
   <script>
     /*
     |@licstart  The following is the entire license notice for the
@@ -39,24 +39,21 @@
   <meta name="robots" content="noindex, nofollow">
   <meta name="referrer" content="no-referrer">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
-  <link rel="shortcut icon" href="<%=settings.faviconPad%>">
+  <link rel="shortcut icon" href="../favicon.ico">
 
   <% e.begin_block("styles"); %>
-  <link href="../static/css/pad.css" rel="stylesheet">
+  <link href="../static/css/pad.css?v=<%=settings.randomVersionString%>" rel="stylesheet">
 
   <% e.begin_block("customStyles"); %>
-  <link href="../static/skins/<%=encodeURI(settings.skinName)%>/pad.css" rel="stylesheet">
+  <link href="../static/skins/<%=encodeURI(settings.skinName)%>/pad.css?v=<%=settings.randomVersionString%>" rel="stylesheet">
   <% e.end_block(); %>
 
   <style title="dynamicsyntax"></style>
   <% e.end_block(); %>
 
   <link rel="localizations" type="application/l10n+json" href="../locales.json" />
-  <script type="text/javascript" src="../static/js/html10n.js"></script>
-  <script type="text/javascript" src="../static/js/l10n.js"></script>
-
-  <!-- head and body had been removed intentionally -->
-
+</head>
+<body>
   <% e.begin_block("body"); %>
 
   <!----------------------------->
@@ -91,25 +88,26 @@
       <div id="editorcontainer" class="editorcontainer"></div>
 
       <div id="editorloadingbox">
-        <div id="passwordRequired">
-          <p data-l10n-id="pad.passwordRequired">You need a password to access this pad</p>
-          <form class='passForm' method='POST'>
-            <input id='passwordinput' type='password' name='password'><input type='submit' value='Submit'>
-          </form>
-        </div>
+        <% e.begin_block("permissionDenied"); %>
         <div id="permissionDenied">
-          <p data-l10n-id="pad.permissionDenied">You do not have permission to access this pad</p>
+          <p data-l10n-id="pad.permissionDenied" class="editorloadingbox-message">
+            You do not have permission to access this pad
+          </p>
         </div>
-        <div id="wrongPassword">
-          <p data-l10n-id="pad.wrongPassword">Your password was wrong</p>
-        </div>
-        <div id="noCookie">
-          <p data-l10n-id="pad.noCookie">Cookie could not be found. Please allow cookies in your browser!</p>
-        </div>
-        <% e.begin_block("loading"); %>
-        <p data-l10n-id="pad.loading" id="loading">Loading...</p>
         <% e.end_block(); %>
-        <noscript><strong>Sorry, you have to enable Javascript in order to use this.</strong></noscript>
+        <% e.begin_block("loading"); %>
+        <p data-l10n-id="pad.loading" id="loading" class="editorloadingbox-message">
+          <img src='../static/img/brand.svg' class='etherpadBrand'><br/>
+          Loading...
+        </p>
+        <% e.end_block(); %>
+        <noscript>
+          <p class="editorloadingbox-message">
+            <strong>
+              Sorry, you have to enable Javascript in order to use this.
+            </strong>
+          </p>
+        </noscript>
       </div>
 
 
@@ -122,7 +120,7 @@
           <% e.begin_block("mySettings"); %>
           <h2 data-l10n-id="pad.settings.myView"></h2>
           <p class="hide-for-mobile">
-              <input type="checkbox" id="options-stickychat" onClick="chat.stickToScreen();">
+              <input type="checkbox" id="options-stickychat">
               <label for="options-stickychat" data-l10n-id="pad.settings.stickychat"></label>
           </p>
           <p class="hide-for-mobile">
@@ -149,10 +147,7 @@
               <label for="viewfontmenu" data-l10n-id="pad.settings.fontType">Font type:</label>
               <select id="viewfontmenu">
                 <option value="" data-l10n-id="pad.settings.fontType.normal">Normal</option>
-                <%= fonts = [
-                          "Quicksand", "Roboto", "Montserrat", "OpenDyslexic", "monospace", "RobotoMono",
-                          "Arial", "Georgia", "Times New Roman", "Verdana", "Courrier New",
-                          "Open Sans", "Lato", "Helvetica" ] %>
+                <%= fonts = ["Quicksand", "Roboto", "Alegreya", "PlayfairDisplay", "Montserrat", "OpenDyslexic", "RobotoMono"] %>
                 <% for(var i=0; i < fonts.length; i++) { %>
                   <option value="<%=fonts[i]%>"><%=fonts[i]%></option>
                 <% } %>
@@ -169,10 +164,10 @@
             </p>
             <% e.end_block(); %>
           </div>
-
+          <button data-l10n-id="pad.settings.delete" id="delete-pad">Delete pad</button>
           <h2 data-l10n-id="pad.settings.about">About</h2>
           <span data-l10n-id="pad.settings.poweredBy">Powered by</span>
-          <a href="https://etherpad.org">Etherpad-lite</a>
+          <a href="https://etherpad.org" target="_blank" referrerpolicy="no-referrer" rel="noopener">Etherpad</a>
           <% if (settings.exposeVersion) { %>(commit <%=settings.getGitCommit()%>)<% } %>
       </div></div>
 
@@ -240,7 +235,9 @@
           </div>
           <div class="reconnecting">
             <h1 data-l10n-id="pad.modals.reconnecting"></h1>
-            <i class='buttonicon buttonicon-spin5 icon-spin'></i>
+            <i class='buttonicon buttonicon-spin5 icon-spin'>
+              <img src='../static/img/brand.svg' class='etherpadBrand'><br/>
+            </i>
           </div>
           <div class="userdup">
             <h1 data-l10n-id="pad.modals.userdup"></h1>
@@ -283,6 +280,15 @@
           <div class="deleted">
             <h1 data-l10n-id="pad.modals.deleted"></h1>
             <p data-l10n-id="pad.modals.deleted.explanation"></p>
+          </div>
+          <div class="rateLimited">
+            <h1 data-l10n-id="pad.modals.rateLimited"></h1>
+            <p data-l10n-id="pad.modals.rateLimited.explanation"></p>
+          </div>
+          <div class="rejected">
+            <h1 data-l10n-id="pad.modals.disconnected"></h1>
+            <h2 data-l10n-id="pad.modals.rejected.explanation"></h2>
+            <p data-l10n-id="pad.modals.rejected.cause"></p>
           </div>
           <div class="disconnected with_reconnect_timer">
             <% e.begin_block("disconnected"); %>
@@ -347,7 +353,6 @@
                 </div>
             </div>
             <div id="otherusers" aria-role="document">
-                <div id="guestprompts"></div>
                 <table id="otheruserstable" cellspacing="0" cellpadding="0" border="0">
                     <tr><td></td></tr>
                 </table>
@@ -380,7 +385,7 @@
             </div>
             <div id="chatinputbox">
                 <form>
-                    <input id="chatinput" type="text" maxlength="999" data-l10n-id="pad.chat.writeMessage.placeholder">
+                    <textarea id="chatinput" maxlength="999" data-l10n-id="pad.chat.writeMessage.placeholder"></textarea>
                 </form>
             </div>
           </div>
@@ -434,83 +439,12 @@
 
   <% e.begin_block("scripts"); %>
 
-  <script type="text/javascript" src="../static/js/require-kernel.js"></script>
-
-  <!-- Include pad_utils manually -->
-  <script type="text/javascript" src="../javascripts/lib/ep_etherpad-lite/static/js/pad_utils.js?callback=require.define"></script>
-
-  <script type="text/javascript">
-      // @license magnet:?xt=urn:btih:8e4f440f4c65981c5bf93c76d35135ba5064d8b7&dn=apache-2.0.txt
-      (function() {
-        // Display errors on page load to the user
-        // (Gets overridden by padutils.setupGlobalExceptionHandler)
-        var originalHandler = window.onerror;
-        window.onerror = function(msg, url, line) {
-          var box   = document.getElementById('editorloadingbox');
-          box.innerHTML = '<p><b>An error occurred while loading the pad</b></p>'
-                        + '<p><b>'+msg+'</b> '
-                        + '<small>in '+ padutils.escapeHTML(url) +' (line '+ line +')</small></p>';
-          // call original error handler
-          if(typeof(originalHandler) == 'function') originalHandler.call(null, arguments);
-        };
-      })();
-      // @license-end
-  </script>
-
-  <script type="text/javascript" src="../socket.io/socket.io.js"></script>
-
-  <!-- Include base packages manually (this help with debugging) -->
-  <script type="text/javascript" src="../javascripts/lib/ep_etherpad-lite/static/js/pad.js?callback=require.define"></script>
-  <script type="text/javascript" src="../javascripts/lib/ep_etherpad-lite/static/js/ace2_common.js?callback=require.define"></script>
+  <script src="<%=entrypoint%>"></script>
 
   <% e.begin_block("customScripts"); %>
-  <script type="text/javascript" src="../static/skins/<%=encodeURI(settings.skinName)%>/pad.js"></script>
+  <script type="text/javascript" src="../static/skins/<%=encodeURI(settings.skinName)%>/pad.js?v=<%=settings.randomVersionString%>"></script>
   <% e.end_block(); %>
-
-  <!-- Bootstrap page -->
-  <script type="text/javascript">
-      // @license magnet:?xt=urn:btih:8e4f440f4c65981c5bf93c76d35135ba5064d8b7&dn=apache-2.0.txt
-      var clientVars = {};
-      (function () {
-        var pathComponents = location.pathname.split('/');
-
-        // Strip 'p' and the padname from the pathname and set as baseURL
-        var baseURL = pathComponents.slice(0,pathComponents.length-2).join('/') + '/';
-
-        require.setRootURI(baseURL + "javascripts/src");
-        require.setLibraryURI(baseURL + "javascripts/lib");
-        require.setGlobalKeyPath("require");
-
-        $ = jQuery = require('ep_etherpad-lite/static/js/rjquery').jQuery; // Expose jQuery #HACK
-        browser = require('ep_etherpad-lite/static/js/browser');
-
-        var plugins = require('ep_etherpad-lite/static/js/pluginfw/client_plugins');
-        var hooks = require('ep_etherpad-lite/static/js/pluginfw/hooks');
-
-        plugins.baseURL = baseURL;
-        plugins.update(function () {
-          hooks.plugins = plugins;
-
-          // Call documentReady hook
-          $(function() {
-            hooks.aCallAll('documentReady');
-          });
-
-          var pad = require('ep_etherpad-lite/static/js/pad');
-          pad.baseURL = baseURL;
-          pad.init();
-        });
-
-        /* TODO: These globals shouldn't exist. */
-        pad = require('ep_etherpad-lite/static/js/pad').pad;
-        chat = require('ep_etherpad-lite/static/js/chat').chat;
-        padeditbar = require('ep_etherpad-lite/static/js/pad_editbar').padeditbar;
-        padimpexp = require('ep_etherpad-lite/static/js/pad_impexp').padimpexp;
-        require('ep_etherpad-lite/static/js/skin_variants');
-
-      }());
-      // @license-end
-  </script>
   <div style="display:none"><a href="/javascript" data-jslicense="1">JavaScript license information</a></div>
   <% e.end_block(); %>
+</body>
 </html>

@@ -1,73 +1,75 @@
 #!/bin/sh
 
-NODE_VERSION="10.18.0"
+set -e
 
-#Move to the folder where ep-lite is installed
-cd $(dirname $0)
+pecho() { printf %s\\n "$*"; }
+log() { pecho "$@"; }
+error() { log "ERROR: $@" >&2; }
+fatal() { error "$@"; exit 1; }
+try() { "$@" || fatal "'$@' failed"; }
+is_cmd() { command -v "$@" >/dev/null 2>&1; }
 
-#Was this script started in the bin folder? if yes move out
-if [ -d "../bin" ]; then
-  cd "../"
-fi
+for x in git unzip wget zip; do
+  is_cmd "${x}" || fatal "Please install ${x}"
+done
 
-#Is wget installed?
-hash wget > /dev/null 2>&1 || {
-  echo "Please install wget" >&2
-  exit 1
-}
+# Move to the folder where Etherpad is checked out
+try cd "${0%/*}"
+workdir=$(try git rev-parse --show-toplevel) || exit 1
+try cd "${workdir}"
+[ -f src/package.json ] || fatal "failed to cd to etherpad root directory"
 
-#Is zip installed?
-hash zip > /dev/null 2>&1 || {
-  echo "Please install zip" >&2
-  exit 1
-}
+# See https://github.com/msys2/MSYS2-packages/issues/1216
+export MSYSTEM=winsymlinks:lnk
 
-#Is zip installed?
-hash unzip > /dev/null 2>&1 || {
-  echo "Please install unzip" >&2
-  exit 1
-}
+OUTPUT=${workdir}/etherpad-win.zip
 
-START_FOLDER=$(pwd);
-TMP_FOLDER=$(mktemp -d)
+TMP_FOLDER=$(try mktemp -d) || exit 1
+trap 'exit 1' HUP INT TERM
+trap 'log "cleaning up..."; try cd / && try rm -rf "${TMP_FOLDER}"' EXIT
 
-echo "create a clean environment in $TMP_FOLDER..."
-cp -ar . $TMP_FOLDER
-cd $TMP_FOLDER
-rm -rf node_modules
-rm -f etherpad-lite-win.zip
+log "create a clean environment in $TMP_FOLDER..."
+try export GIT_WORK_TREE=${TMP_FOLDER}; git checkout HEAD -f \
+    || fatal "failed to copy etherpad to temporary folder"
+try mkdir "${TMP_FOLDER}"/.git
+try git rev-parse HEAD >${TMP_FOLDER}/.git/HEAD
+# Disable symlinks to avoid problems with Windows
+#try pnpm i "${TMP_FOLDER}"/src/node_modules
+
+try cd "${TMP_FOLDER}"
+[ -f src/package.json ] || fatal "failed to copy etherpad to temporary folder"
 
 # setting NODE_ENV=production ensures that dev dependencies are not installed,
 # making the windows package smaller
-export NODE_ENV=production
+export NODE_ENV=development
 
-echo "do a normal unix install first..."
-bin/installDeps.sh || exit 1
+rm -rf node_modules || true
+rm -rf src/node_modules || true
 
-echo "copy the windows settings template..."
-cp settings.json.template settings.json
+#log "do a normal unix install first..."
+#$(try cd ./bin/installDeps.sh)
 
-echo "resolve symbolic links..."
-cp -rL node_modules node_modules_resolved
-rm -rf node_modules
-mv node_modules_resolved node_modules
+# Install admin frontend
+try pnpm install
+try pnpm run build:etherpad
 
-echo "download windows node..."
-cd bin
-wget "https://nodejs.org/dist/v$NODE_VERSION/win-x86/node.exe" -O ../node.exe
+# Nuke the admin folder as it is not needed anymore :D
+rm -rf admin
+rm -rf oidc
+rm -rf src/node_modules
 
-echo "remove git history to reduce folder size"
-rm -rf .git/objects
+log "copy the windows settings template..."
+try cp settings.json.template settings.json
 
-echo "remove windows jsdom-nocontextify/test folder"
-rm -rf $TMP_FOLDER/src/node_modules/wd/node_modules/request/node_modules/form-data/node_modules/combined-stream/test
-rm -rf $TMP_FOLDER/src/node_modules/nodemailer/node_modules/mailcomposer/node_modules/mimelib/node_modules/encoding/node_modules/iconv-lite/encodings/tables
+#log "resolve symbolic links..."
+#try cp -rL node_modules node_modules_resolved
+#try rm -rf node_modules
+#try mv node_modules_resolved node_modules
 
-echo "create the zip..."
-cd $TMP_FOLDER
-zip -9 -r $START_FOLDER/etherpad-lite-win.zip ./*
+log "download windows node..."
+try wget "https://nodejs.org/dist/latest-v20.x/win-x64/node.exe" -O node.exe
 
-echo "clean up..."
-rm -rf $TMP_FOLDER
+log "create the zip..."
+try zip -9 -r "${OUTPUT}" ./*
 
-echo "Finished. You can find the zip in the Etherpad root folder, it's called etherpad-lite-win.zip"
+log "Finished. You can find the zip at ${OUTPUT}"
