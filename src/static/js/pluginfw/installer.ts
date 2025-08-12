@@ -13,10 +13,13 @@ import {promises as fs} from "fs";
 const plugins = require('./plugins');
 const hooks = require('./hooks');
 const runCmd = require('../../../node/utils/run_cmd');
-const settings = require('../../../node/utils/Settings');
+import  settings, {
+  getEpVersion,
+  reloadSettings
+} from '../../../node/utils/Settings';
 import {LinkInstaller} from "./LinkInstaller";
 
-const {findEtherpadRoot} = require('../../../node/utils/AbsolutePaths');
+import {findEtherpadRoot} from '../../../node/utils/AbsolutePaths';
 const logger = log4js.getLogger('plugins');
 
 export const pluginInstallPath = path.join(settings.root, 'src','plugin_packages');
@@ -27,13 +30,13 @@ export const installedPluginsPath = path.join(settings.root, 'var/installed_plug
 const onAllTasksFinished = async () => {
   await plugins.update();
   await persistInstalledPlugins();
-  settings.reloadSettings();
+  reloadSettings();
   await hooks.aCallAll('loadSettings', {settings});
   await hooks.aCallAll('restartServer');
 };
 
 const headers = {
-  'User-Agent': `Etherpad/${settings.getEpVersion()}`,
+  'User-Agent': `Etherpad/${getEpVersion()}`,
 };
 
 let tasks = 0;
@@ -162,23 +165,18 @@ export const install = async (pluginName: string, cb:Function|null = null) => {
 export let availablePlugins:MapArrayType<PackageInfo>|null = null;
 let cacheTimestamp = 0;
 
-export const getAvailablePlugins = (maxCacheAge: number|false) => {
+export const getAvailablePlugins = async (maxCacheAge: number | false) => {
   const nowTimestamp = Math.round(Date.now() / 1000);
 
-  return new Promise<MapArrayType<PackageInfo>>(async (resolve, reject) => {
-    // check cache age before making any request
-    if (availablePlugins && maxCacheAge && (nowTimestamp - cacheTimestamp) <= maxCacheAge) {
-      return resolve(availablePlugins);
-    }
+  // check cache age before making any request
+  if (availablePlugins && maxCacheAge && (nowTimestamp - cacheTimestamp) <= maxCacheAge) {
+    return availablePlugins;
+  }
 
-    await axios.get(`${settings.updateServer}/plugins.json`, {headers})
-        .then((pluginsLoaded:AxiosResponse<MapArrayType<PackageInfo>>) => {
-          availablePlugins = pluginsLoaded.data;
-          cacheTimestamp = nowTimestamp;
-          resolve(availablePlugins);
-        })
-        .catch(async (err) => reject(err));
-  });
+  const pluginsLoaded: AxiosResponse<MapArrayType<PackageInfo>> = await axios.get(`${settings.updateServer}/plugins.json`, {headers})
+  availablePlugins = pluginsLoaded.data;
+  cacheTimestamp = nowTimestamp;
+  return availablePlugins;
 };
 
 
@@ -211,4 +209,7 @@ export const search = (searchTerm: string, maxCacheAge: number) => getAvailableP
 
       return res;
     }
-);
+).catch((err)=>{
+  logger.error(`Error searching plugins: ${err}`);
+  return {} as MapArrayType<PackageInfo>;
+});

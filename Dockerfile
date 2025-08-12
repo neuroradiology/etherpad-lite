@@ -5,7 +5,7 @@
 # Author: muxator
 ARG BUILD_ENV=git
 
-FROM node:alpine AS adminbuild
+FROM node:lts-alpine AS adminbuild
 RUN npm install -g pnpm@latest
 WORKDIR /opt/etherpad-lite
 COPY . .
@@ -13,7 +13,7 @@ RUN pnpm install
 RUN pnpm run build:ui
 
 
-FROM node:alpine AS build
+FROM node:lts-alpine AS build
 LABEL maintainer="Etherpad team, https://github.com/ether/etherpad-lite"
 
 # Set these arguments when building the image from behind a proxy
@@ -107,7 +107,8 @@ RUN  \
         curl \
         git \
         ${INSTALL_ABIWORD:+abiword abiword-plugin-command} \
-        ${INSTALL_SOFFICE:+libreoffice openjdk8-jre libreoffice-common}
+        ${INSTALL_SOFFICE:+libreoffice openjdk8-jre libreoffice-common} && \
+    rm -rf /var/cache/apk/*
 
 USER etherpad
 
@@ -132,17 +133,31 @@ FROM build AS build_copy
 
 FROM build_${BUILD_ENV} AS development
 
+ARG ETHERPAD_PLUGINS=
+ARG ETHERPAD_LOCAL_PLUGINS=
+ARG ETHERPAD_LOCAL_PLUGINS_ENV=
+ARG ETHERPAD_GITHUB_PLUGINS=
+
 COPY --chown=etherpad:etherpad ./src/ ./src/
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/ templates/admin./src/templates/admin
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/static/oidc ./src/static/oidc
 
+COPY --chown=etherpad:etherpad ./local_plugin[s] ./local_plugins/
+
+RUN bash -c ./bin/installLocalPlugins.sh
+
 RUN bin/installDeps.sh && \
-    if [ ! -z "${ETHERPAD_PLUGINS}" ] || [ ! -z "${ETHERPAD_LOCAL_PLUGINS}" ] || [ ! -z "${ETHERPAD_GITHUB_PLUGINS}" ]; then \
-        pnpm run plugins i ${ETHERPAD_PLUGINS} ${ETHERPAD_LOCAL_PLUGINS:+--path ${ETHERPAD_LOCAL_PLUGINS}} ${ETHERPAD_GITHUB_PLUGINS:+--github ${ETHERPAD_GITHUB_PLUGINS}}; \
-    fi
+  if [ ! -z "${ETHERPAD_PLUGINS}" ] || [ ! -z "${ETHERPAD_GITHUB_PLUGINS}" ]; then \
+      pnpm run plugins i ${ETHERPAD_PLUGINS} ${ETHERPAD_GITHUB_PLUGINS:+--github ${ETHERPAD_GITHUB_PLUGINS}}; \
+  fi
 
 
 FROM build_${BUILD_ENV} AS production
+
+ARG ETHERPAD_PLUGINS=
+ARG ETHERPAD_LOCAL_PLUGINS=
+ARG ETHERPAD_LOCAL_PLUGINS_ENV=
+ARG ETHERPAD_GITHUB_PLUGINS=
 
 ENV NODE_ENV=production
 ENV ETHERPAD_PRODUCTION=true
@@ -151,10 +166,15 @@ COPY --chown=etherpad:etherpad ./src ./src
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/templates/admin ./src/templates/admin
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/static/oidc ./src/static/oidc
 
-RUN bin/installDeps.sh && rm -rf ~/.npm && rm -rf ~/.local && rm -rf ~/.cache && \
-    if [ ! -z "${ETHERPAD_PLUGINS}" ] || [ ! -z "${ETHERPAD_LOCAL_PLUGINS}" ] || [ ! -z "${ETHERPAD_GITHUB_PLUGINS}" ]; then \
-      pnpm run plugins i ${ETHERPAD_PLUGINS} ${ETHERPAD_LOCAL_PLUGINS:+--path ${ETHERPAD_LOCAL_PLUGINS}} ${ETHERPAD_GITHUB_PLUGINS:+--github ${ETHERPAD_GITHUB_PLUGINS}}; \
-    fi
+COPY --chown=etherpad:etherpad ./local_plugin[s] ./local_plugins/
+
+RUN bash -c ./bin/installLocalPlugins.sh
+
+RUN bin/installDeps.sh && \
+  if [ ! -z "${ETHERPAD_PLUGINS}" ] || [ ! -z "${ETHERPAD_GITHUB_PLUGINS}" ]; then \
+      pnpm run plugins i ${ETHERPAD_PLUGINS} ${ETHERPAD_GITHUB_PLUGINS:+--github ${ETHERPAD_GITHUB_PLUGINS}}; \
+  fi && \
+    pnpm store prune
 
 # Copy the configuration file.
 COPY --chown=etherpad:etherpad ${SETTINGS} "${EP_DIR}"/settings.json

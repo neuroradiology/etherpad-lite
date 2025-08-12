@@ -4,17 +4,15 @@ import {Socket} from "node:net";
 import type {MapArrayType} from "../types/MapType";
 
 import _ from 'underscore';
-// @ts-ignore
 import cookieParser from 'cookie-parser';
 import events from 'events';
 import express from 'express';
-// @ts-ignore
-import expressSession from '@etherpad/express-session';
+import expressSession, {Store} from 'express-session';
 import fs from 'fs';
 const hooks = require('../../static/js/pluginfw/hooks');
 import log4js from 'log4js';
 const SessionStore = require('../db/SessionStore');
-const settings = require('../utils/Settings');
+import settings, {getEpVersion, getGitCommit} from '../utils/Settings';
 const stats = require('../stats')
 import util from 'util';
 const webaccess = require('./express/webaccess');
@@ -24,7 +22,7 @@ import SecretRotator from '../security/SecretRotator';
 let secretRotator: SecretRotator|null = null;
 const logger = log4js.getLogger('http');
 let serverName:string;
-let sessionStore: { shutdown: () => void; } | null;
+let sessionStore: Store | null;
 const sockets:Set<Socket> = new Set();
 const socketsEvents = new events.EventEmitter();
 const startTime = stats.settableGauge('httpStartTime');
@@ -59,6 +57,7 @@ const closeServer = async () => {
     startTime.setValue(0);
     logger.info('HTTP server closed');
   }
+  // @ts-ignore
   if (sessionStore) sessionStore.shutdown();
   sessionStore = null;
   if (secretRotator) secretRotator.stop();
@@ -68,9 +67,9 @@ const closeServer = async () => {
 exports.createServer = async () => {
   console.log('Report bugs at https://github.com/ether/etherpad-lite/issues');
 
-  serverName = `Etherpad ${settings.getGitCommit()} (https://etherpad.org)`;
+  serverName = `Etherpad ${getGitCommit()} (https://etherpad.org)`;
 
-  console.log(`Your Etherpad version is ${settings.getEpVersion()} (${settings.getGitCommit()})`);
+  console.log(`Your Etherpad version is ${getEpVersion()} (${getGitCommit()})`);
 
   await exports.restartServer();
 
@@ -177,7 +176,7 @@ exports.restartServer = async () => {
   // starts listening to requests as reported in issue #158. Not installing the log4js connect
   // logger when the log level has a higher severity than INFO since it would not log at that level
   // anyway.
-  if (!(settings.loglevel === 'WARN' && settings.loglevel === 'ERROR')) {
+  if (!(settings.loglevel === 'WARN' || settings.loglevel === 'ERROR')) {
     app.use(log4js.connectLogger(logger, {
       level: log4js.levels.DEBUG.levelStr,
       format: ':status, :method :url',
@@ -190,7 +189,12 @@ exports.restartServer = async () => {
     secretRotator = new SecretRotator(
         'expressSessionSecrets', keyRotationInterval, sessionLifetime, settings.sessionKey);
     await secretRotator.start();
-    secret = secretRotator.secrets;
+    const secrets = secretRotator.secrets;
+    if (Array.isArray(secrets)) {
+      secret = secrets[0];
+    } else {
+      secret = secretRotator.secrets as unknown as string;
+    }
   }
   if (!secret) throw new Error('missing cookie signing secret');
 
@@ -198,17 +202,16 @@ exports.restartServer = async () => {
 
   sessionStore = new SessionStore(settings.cookie.sessionRefreshInterval);
   exports.sessionMiddleware = expressSession({
-    propagateTouch: true,
     rolling: true,
     secret,
-    store: sessionStore,
+    store: sessionStore ?? undefined,
     resave: false,
     saveUninitialized: false,
     // Set the cookie name to a javascript identifier compatible string. Makes code handling it
     // cleaner :)
     name: 'express_sid',
     cookie: {
-      maxAge: sessionLifetime || null, // Convert 0 to null.
+      maxAge: sessionLifetime || undefined, // Convert 0 to null.
       sameSite: settings.cookie.sameSite,
 
       // The automatic express-session mechanism for determining if the application is being served
@@ -234,7 +237,7 @@ exports.restartServer = async () => {
   // Give plugins an opportunity to install handlers/middleware before the express-session
   // middleware. This allows plugins to avoid creating an express-session record in the database
   // when it is not needed (e.g., public static content).
-  await hooks.aCallAll('expressPreSession', {app});
+  await hooks.aCallAll('expressPreSession', {app, settings});
   app.use(exports.sessionMiddleware);
 
   app.use(webaccess.checkAccess);

@@ -186,7 +186,7 @@ const paduserlist = (() => {
         const tr = input.closest('tr');
         if (tr.length > 0) {
           const index = tr.parent().children().index(tr);
-          if (index >= 0) {
+          if (index >= 0 && rowsPresent.length > index) {
             const userId = rowsPresent[index].data.id;
             rowManagerMakeNameEditor($(this), userId);
           }
@@ -489,6 +489,15 @@ const paduserlist = (() => {
           online++;
         }
       }
+      const recentPadsList = JSON.parse(localStorage.getItem('recentPads'));
+      const pathSegments = window.location.pathname.split('/');
+      const padName = pathSegments[pathSegments.length - 1];
+      const existingPad = recentPadsList.find((pad) => pad.name === padName);
+      if (existingPad) {
+        existingPad.members = online;
+      }
+      localStorage.setItem('recentPads', JSON.stringify(recentPadsList));
+
 
       $('#online_count').text(online);
 

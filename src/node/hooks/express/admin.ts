@@ -2,10 +2,9 @@
 import {ArgsExpressType} from "../../types/ArgsExpressType";
 import path from "path";
 import fs from "fs";
-import * as url from "node:url";
 import {MapArrayType} from "../../types/MapType";
 
-const settings = require('ep_etherpad-lite/node/utils/Settings');
+import settings from 'ep_etherpad-lite/node/utils/Settings';
 
 const ADMIN_PATH = path.join(settings.root, 'src', 'templates');
 const PROXY_HEADER = "x-proxy-path"
@@ -22,11 +21,15 @@ exports.expressCreateServer = (hookName: string, args: ArgsExpressType, cb: Func
     console.error('admin template not found, skipping admin interface. You need to rebuild it in /admin with pnpm run build-copy')
     return cb();
   }
-  args.app.get('/admin/*', (req: any, res: any) => {
-    // parse URL
-    const parsedUrl = url.parse(req.url);
+  args.app.get('/admin/{*filename}', (req: any, res: any) => {
     // extract URL path
-    let pathname = ADMIN_PATH + `${parsedUrl.pathname}`;
+    let pathname = path.join(ADMIN_PATH, req.url);
+    pathname = path.normalize(pathname)
+
+    if (!pathname.startsWith(ADMIN_PATH)) {
+      res.statusCode = 403;
+      return res.end("Forbidden");
+    }
     // based on the URL path, extract the file extension. e.g. .js, .doc, ...
     let ext = path.parse(pathname).ext;
     // maps file extension to MIME typere

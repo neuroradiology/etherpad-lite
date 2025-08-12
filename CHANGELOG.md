@@ -1,3 +1,57 @@
+# 2.5.0
+
+### Notable enhancements and fixes
+- Updated to express 5.0.0. This is a major update to express that brings a lot of improvements and fixes.
+
+# 2.4.2
+
+### Notable enhancements and fixes
+- Fixed a german translation in the english translation file.
+
+# 2.4.1
+
+### Notable enhancements and fixes
+
+- Added generating release through ci cd pipeline.
+- Readded temporarily disabled workflows after release generation works again
+
+# 2.4.0
+
+### Notable enhancements and fixes
+- Added home button to the pad panel. To show it in your current instance, please copy the updated "toolbar" settings from the `settings.json.template` file to your `settings.json` file.
+- Added more current design for the default collibri theme.
+- Added handling of recent visited pads in the collibri theme. You can now access the most recent three pads you visited in the pad panel.
+- Disable stats endpoints if enableMetrics is set to false. This allows you to disable the metrics endpoints if you don't want to use them.
+- Use Node LTS instead of always latest Node version.
+
+
+# 2.3.2
+
+### Notable enhancements and fixes
+
+- Fixed admin ui displaying incorrect text
+
+# 2.3.1
+
+### Notable enhancements and fixes
+
+- Dependency updates
+
+# 2.3.0
+
+### Notable enhancements and fixes
+
+- Added possibility to cluster Etherpads behind reverse proxy. There is now a new reverse proxy designed for Etherpads that handles multiple Etherpads and the created pads in them. It will assign the pad assignement to an Etherpad at random but once the choice was made it will always reverse proxy the same backend. This allows to host multiple concurrent Etherpads and benefit from multi core systems even though one Etherpad is singlethreaded.
+- Added reverse proxy configuration for replacing Nginx. In the past there were some issues with nginx and its configuration. This reverse proxy allows you to handle your configuration with ease.
+
+If you want to find out more about the reverse proxy method check out the repository https://github.com/ether/etherpad-proxy . It also contains a sample docker-compose file with three Etherpads and one etherpad-proxy. Of course you need to adapt the settings.json.template to your liking and map it into the reverse proxy image before you are ready :).
+
+
+- Added client authorization to work with Etherpad. Before it would get blocked because it doesn't have the required claim. As this is now fixed etherpad-proxy can also work with your new OAuth2 configuration and retrieve a token via client credentials flow.
+
+
+
+
 # 2.2.7
 
 

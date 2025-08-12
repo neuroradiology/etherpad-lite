@@ -6,9 +6,9 @@ import {SocketClientRequest} from "../../types/SocketClientRequest";
 import {WebAccessTypes} from "../../types/WebAccessTypes";
 import {SettingsUser} from "../../types/SettingsUser";
 const httpLogger = log4js.getLogger('http');
-const settings = require('../../utils/Settings');
+import settings from '../../utils/Settings';
 const hooks = require('../../../static/js/pluginfw/hooks');
-const readOnlyManager = require('../../db/ReadOnlyManager');
+import readOnlyManager from '../../db/ReadOnlyManager';
 
 hooks.deprecationNotices.authFailure = 'use the authnFailure and authzFailure hooks instead';
 
@@ -49,8 +49,21 @@ exports.userCanModify = (padId: string, req: SocketClientRequest) => {
 // Exported so that tests can set this to 0 to avoid unnecessary test slowness.
 exports.authnFailureDelayMs = 1000;
 
+const staticResources = [
+  /^\/padbootstrap-[a-zA-Z0-9]+\.min\.js$/,
+  /^\/timeSliderBootstrap-[a-zA-Z0-9]+\.min\.js$/,
+  /^\/manifest.json$/
+]
+
 const checkAccess = async (req:any, res:any, next: Function) => {
   const requireAdmin = req.path.toLowerCase().startsWith('/admin-auth');
+  for (const staticResource of staticResources) {
+    if (req.path.match(staticResource)) {
+      console.log(`Loading [${staticResource}] ${req.path}`);
+      return next()
+    }
+  }
+
 
   // ///////////////////////////////////////////////////////////////////////////////////////////////
   // Step 1: Check the preAuthorize hook for early permit/deny (permit is only allowed for non-admin

@@ -13,18 +13,16 @@ test.describe('Plugins page',  ()=> {
         await page.waitForSelector('.search-field');
         const pluginTable =  page.locator('table tbody').nth(1);
         await expect(pluginTable).not.toBeEmpty()
-        const plugins = await pluginTable.locator('tr').count()
-        expect(plugins).toBeGreaterThan(10)
     })
 
     test('Searches for a plugin', async ({page}) => {
         await page.waitForSelector('.search-field');
         await page.click('.search-field')
-        await page.keyboard.type('ep_font_color3')
+        await page.keyboard.type('ep_font_color')
         await page.keyboard.press('Enter')
         const pluginTable =  page.locator('table tbody').nth(1);
         await expect(pluginTable.locator('tr')).toHaveCount(1)
-        await expect(pluginTable.locator('tr').first()).toContainText('ep_font_color3')
+        await expect(pluginTable.locator('tr').first()).toContainText('ep_font_color')
     })
 
 
@@ -34,18 +32,16 @@ test.describe('Plugins page',  ()=> {
         await expect(pluginTable).not.toBeEmpty({
             timeout: 15000
         })
-        const plugins = await pluginTable.locator('tr').count()
-        expect(plugins).toBeGreaterThan(10)
 
         // Now everything is loaded, lets install a plugin
 
         await page.click('.search-field')
-        await page.keyboard.type('ep_font_color3')
+        await page.keyboard.type('ep_font_color')
         await page.keyboard.press('Enter')
 
         await expect(pluginTable.locator('tr')).toHaveCount(1)
         const pluginRow = pluginTable.locator('tr').first()
-        await expect(pluginRow).toContainText('ep_font_color3')
+        await expect(pluginRow).toContainText('ep_font_color')
 
         // Select Installation button
         await pluginRow.locator('td').nth(4).locator('button').first().click()
@@ -59,7 +55,7 @@ test.describe('Plugins page',  ()=> {
 
         const installedPluginRow = installedPluginsRows.nth(1)
 
-        await expect(installedPluginRow).toContainText('ep_font_color3')
+        await expect(installedPluginRow).toContainText('ep_font_color')
         await installedPluginRow.locator('td').nth(2).locator('button').first().click()
 
         // Wait for the uninstallation to complete

@@ -5,9 +5,10 @@ import {ErrorCaused} from "../../types/ErrorCaused";
 import {QueryType} from "../../types/QueryType";
 
 import {getAvailablePlugins, install, search, uninstall} from "../../../static/js/pluginfw/installer";
-import {PackageData} from "../../types/PackageInfo";
+import {PackageData, PackageInfo} from "../../types/PackageInfo";
 import semver from 'semver';
 import log4js from 'log4js';
+import {MapArrayType} from "../../types/MapType";
 
 const pluginDefs = require('../../../static/js/pluginfw/plugin_defs');
 const logger = log4js.getLogger('adminPlugins');
@@ -21,7 +22,13 @@ exports.socketio = (hookName:string, args:ArgsExpressType, cb:Function) => {
     if (!isAdmin) return;
 
     const checkPluginForUpdates = async () => {
-      const results = await getAvailablePlugins(/* maxCacheAge:*/ 60 * 10);
+      let results: MapArrayType<PackageInfo>
+      try {
+        results = await getAvailablePlugins(/* maxCacheAge:*/ 60 * 10);
+      } catch (error) {
+        console.error('Error checking for plugin updates:', error);
+        return [];
+      }
       return Object.keys(pluginDefs.plugins).filter((plugin) => {
         if (!results[plugin]) return false;
 
@@ -31,6 +38,11 @@ exports.socketio = (hookName:string, args:ArgsExpressType, cb:Function) => {
         return semver.gt(latestVersion, currentVersion);
       })
     }
+
+    socket.on('getStats', ()=>{
+      console.log("Getting stats for admin plugins");
+      socket.emit('results:stats', require('../../stats').toJSON());
+    })
 
     socket.on('getInstalled', async (query: string) => {
       // send currently installed plugins
@@ -45,6 +57,7 @@ exports.socketio = (hookName:string, args:ArgsExpressType, cb:Function) => {
 
       socket.emit('results:installed', {installed});
     });
+
 
     socket.on('checkUpdates', async () => {
       // Check plugins for updates
