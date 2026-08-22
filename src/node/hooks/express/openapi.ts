@@ -25,6 +25,7 @@ const createHTTPError = require('http-errors');
 
 const apiHandler = require('../../handler/APIHandler');
 import settings from '../../utils/Settings';
+import {sanitizeHost, sanitizePublicURL} from '../../utils/sanitizeOrigin';
 
 import log4js from 'log4js';
 const logger = log4js.getLogger('API');
@@ -86,14 +87,14 @@ const resources:SwaggerUIResource = {
     },
     listSessions: {
       operationId: 'listSessionsOfGroup',
-      summary: '',
+      summary: 'returns all sessions of a group',
       responseSchema: {
         sessions: {type: 'array', items: {$ref: '#/components/schemas/SessionInfo'}},
       },
     },
     list: {
       operationId: 'listAllGroups',
-      summary: '',
+      summary: 'returns the IDs of all groups on this server',
       responseSchema: {groupIDs: {type: 'array', items: {type: 'string'}}},
     },
   },
@@ -128,6 +129,10 @@ const resources:SwaggerUIResource = {
       summary: 'Returns the Author Name of the author',
       responseSchema: {info: {$ref: '#/components/schemas/UserInfo'}},
     },
+    anonymize: {
+      operationId: 'anonymizeAuthor',
+      summary: 'anonymizes an author across all their edits',
+    },
   },
 
   // Session
@@ -158,11 +163,12 @@ const resources:SwaggerUIResource = {
     },
     createDiffHTML: {
       operationId: 'createDiffHTML',
-      summary: '',
+      summary: 'returns an HTML diff between two revisions of a pad',
       responseSchema: {},
     },
     create: {
       operationId: 'createPad',
+      summary: 'creates a new (non-group) pad',
       description:
           'creates a new (non-group) pad. Note that if you need to create a group Pad, ' +
           'you should call createGroupPad',
@@ -234,22 +240,82 @@ const resources:SwaggerUIResource = {
     },
     checkToken: {
       operationId: 'checkToken',
-      summary: 'returns ok when the current api token is valid',
+      summary: 'returns ok when the current API token is valid',
+      tags: ['server'],
     },
     getChatHistory: {
       operationId: 'getChatHistory',
       summary: 'returns the chat history',
+      tags: ['chat'],
       responseSchema: {messages: {type: 'array', items: {$ref: '#/components/schemas/Message'}}},
     },
     // We need an operation that returns a Message so it can be picked up by the codegen :(
     getChatHead: {
       operationId: 'getChatHead',
       summary: 'returns the chatHead (chat-message) of the pad',
+      tags: ['chat'],
       responseSchema: {chatHead: {$ref: '#/components/schemas/Message'}},
     },
     appendChatMessage: {
       operationId: 'appendChatMessage',
       summary: 'appends a chat message',
+      tags: ['chat'],
+    },
+    getAttributePool: {
+      operationId: 'getAttributePool',
+      summary: 'returns the attribute pool of a pad',
+    },
+    getRevisionChangeset: {
+      operationId: 'getRevisionChangeset',
+      summary: 'returns the changeset at a given revision of a pad',
+    },
+    copyPad: {
+      operationId: 'copyPad',
+      summary: 'copies a pad with full history and chat',
+    },
+    movePad: {
+      operationId: 'movePad',
+      summary: 'moves a pad — copy then delete the original',
+    },
+    getPadID: {
+      operationId: 'getPadID',
+      summary: 'returns the read-write pad ID for a given read-only pad ID',
+    },
+    getSavedRevisionsCount: {
+      operationId: 'getSavedRevisionsCount',
+      summary: 'returns the number of saved revisions of a pad',
+    },
+    listSavedRevisions: {
+      operationId: 'listSavedRevisions',
+      summary: 'returns the list of saved revisions of a pad',
+    },
+    saveRevision: {
+      operationId: 'saveRevision',
+      summary: 'saves a revision of a pad',
+    },
+    restoreRevision: {
+      operationId: 'restoreRevision',
+      summary: 'restores a pad to a specific revision',
+    },
+    appendText: {
+      operationId: 'appendText',
+      summary: 'appends text to a pad',
+    },
+    copyPadWithoutHistory: {
+      operationId: 'copyPadWithoutHistory',
+      summary: 'copies a pad without history or chat',
+    },
+    compactPad: {
+      operationId: 'compactPad',
+      summary: 'compacts a pad\'s revision history, keeping recent revisions only',
+    },
+  },
+
+  // Server
+  server: {
+    getStats: {
+      operationId: 'getStats',
+      summary: 'returns server-wide statistics',
     },
   },
 };
@@ -396,7 +462,7 @@ const defaultResponseRefs:OpenAPISuccessResponse = {
 const operations: OpenAPIOperations = {};
 for (const [resource, actions] of Object.entries(resources)) {
   for (const [action, spec] of Object.entries(actions)) {
-    const {operationId,responseSchema, ...operation} = spec;
+    const {operationId, responseSchema, tags: customTags, ...operation} = spec as any;
 
     // add response objects
     const responses:OpenAPISuccessResponse = {...defaultResponseRefs};
@@ -409,20 +475,43 @@ for (const [resource, actions] of Object.entries(resources)) {
     }
 
     // add final operation object to dictionary
+    // tags default to [resource] but can be overridden per-op via spec.tags
+    // (e.g. chat ops nested under pad use tags: ['chat']).
     operations[operationId] = {
       operationId,
       ...operation,
       responses,
-      tags: [resource],
+      tags: customTags || [resource],
       _restPath: `/${resource}/${action}`,
     };
   }
 }
 
-const generateDefinitionForVersion = (version:string, style = APIPathStyle.FLAT) => {
-  const definition = {
+/**
+ * Generate the OpenAPI definition for a given API version + path style.
+ *
+ * The `public` flag controls whether the spec is the *runtime* definition (used
+ * to dispatch requests via openapi-backend, which still routes both GET and
+ * POST for backward compatibility with older clients) or the *published* spec
+ * (served at /api/openapi.json etc., advertising only POST so generated tooling
+ * — printingpress.dev, openapi-generator, Postman — sees a clean surface).
+ */
+const generateDefinitionForVersion = (
+    version: string,
+    style: string = APIPathStyle.FLAT,
+    {public: isPublic = false}: {public?: boolean} = {},
+) => {
+  const definition: any = {
     openapi: OPENAPI_VERSION,
     info,
+    tags: [
+      {name: 'pad',     description: 'Pad lifecycle, content, revisions, attributes'},
+      {name: 'author',  description: 'Authors and authorship'},
+      {name: 'session', description: 'Group sessions'},
+      {name: 'group',   description: 'Groups (multi-tenant pads)'},
+      {name: 'chat',    description: 'In-pad chat history'},
+      {name: 'server',  description: 'Server-level operations (stats, token check)'},
+    ],
     paths: {},
     components: {
       parameters: {},
@@ -482,26 +571,44 @@ const generateDefinitionForVersion = (version:string, style = APIPathStyle.FLAT)
       responses: {
         ...defaultResponses,
       },
-      securitySchemes: {
-        openid: {
-          type: "oauth2",
-          flows: {
-            authorizationCode: {
-              authorizationUrl: settings.sso.issuer+"/oidc/auth",
-              tokenUrl: settings.sso.issuer+"/oidc/token",
-              scopes: {
-                openid: "openid",
-                profile: "profile",
-                email: "email",
-                admin: "admin"
-              }
-            }
+      securitySchemes: {} as Record<string, any>,
+    },
+    security: [] as Array<Record<string, string[]>>,
+  };
+
+  if (settings.authenticationMethod === 'apikey') {
+    definition.components.securitySchemes.apiKey = {
+      type: 'apiKey', name: 'apikey', in: 'query',
+    };
+    definition.components.securitySchemes.apiKeyAlias = {
+      type: 'apiKey', name: 'api_key', in: 'query',
+    };
+    definition.components.securitySchemes.apiKeyHeader = {
+      type: 'apiKey', name: 'apikey', in: 'header',
+    };
+    definition.security = [
+      {apiKey: []},
+      {apiKeyAlias: []},
+      {apiKeyHeader: []},
+    ];
+  } else {
+    definition.components.securitySchemes.openid = {
+      type: 'oauth2',
+      flows: {
+        authorizationCode: {
+          authorizationUrl: settings.sso.issuer + '/oidc/auth',
+          tokenUrl: settings.sso.issuer + '/oidc/token',
+          scopes: {
+            openid: 'openid',
+            profile: 'profile',
+            email: 'email',
+            admin: 'admin',
           },
         },
       },
-    },
-    security: [{openid: []}],
-  };
+    };
+    definition.security = [{openid: []}];
+  }
 
   // build operations
   for (const funcName of Object.keys(apiHandler.version[version])) {
@@ -541,18 +648,29 @@ const generateDefinitionForVersion = (version:string, style = APIPathStyle.FLAT)
     delete operation._restPath;
 
     // add to definition
-    // NOTE: It may be confusing that every operation can be called with both GET and POST
-    // @ts-ignore
-    definition.paths[path] = {
-      get: {
-        ...operation,
-        operationId: `${operation.operationId}UsingGET`,
-      },
-      post: {
-        ...operation,
-        operationId: `${operation.operationId}UsingPOST`,
-      },
-    };
+    // The runtime spec advertises both GET and POST so existing clients (some of
+    // which still pass apikey/params via query string) keep working. The public
+    // spec served at /api/openapi.json advertises only POST — that is the
+    // recommended call style and what downstream codegens should target.
+    if (isPublic) {
+      definition.paths[path] = {
+        post: {
+          ...operation,
+          operationId: `${operation.operationId}UsingPOST`,
+        },
+      };
+    } else {
+      definition.paths[path] = {
+        get: {
+          ...operation,
+          operationId: `${operation.operationId}UsingGET`,
+        },
+        post: {
+          ...operation,
+          operationId: `${operation.operationId}UsingPOST`,
+        },
+      };
+    }
   }
   return definition;
 };
@@ -566,14 +684,18 @@ exports.expressPreSession = async (hookName:string, {app}:any) => {
     for (const style of [APIPathStyle.FLAT, APIPathStyle.REST]) {
       const apiRoot = getApiRootForVersion(version, style);
 
-      // generate openapi definition for this API version
+      // generate openapi definition for this API version (used for openapi-backend routing)
       const definition = generateDefinitionForVersion(version, style);
 
-      // serve version specific openapi definition
+      // serve version specific openapi definition; regenerate per request so runtime
+      // settings (e.g. authenticationMethod) are reflected. The served spec uses
+      // {public: true} to advertise only POST per path (the runtime backend below
+      // still routes both GET and POST for backward compatibility).
       app.get(`${apiRoot}/openapi.json`, (req:any, res:any) => {
         // For openapi definitions, wide CORS is probably fine
         res.header('Access-Control-Allow-Origin', '*');
-        res.json({...definition, servers: [generateServerForApiVersion(apiRoot, req)]});
+        const liveDefinition = generateDefinitionForVersion(version, style, {public: true});
+        res.json({...liveDefinition, servers: [generateServerForApiVersion(apiRoot, req)]});
       });
 
       // serve latest openapi definition file under /api/openapi.json
@@ -581,7 +703,8 @@ exports.expressPreSession = async (hookName:string, {app}:any) => {
       if (isLatestAPIVersion) {
         app.get(`/${style}/openapi.json`, (req:any, res:any) => {
           res.header('Access-Control-Allow-Origin', '*');
-          res.json({...definition, servers: [generateServerForApiVersion(apiRoot, req)]});
+          const liveDefinition = generateDefinitionForVersion(version, style, {public: true});
+          res.json({...liveDefinition, servers: [generateServerForApiVersion(apiRoot, req)]});
         });
       }
 
@@ -612,17 +735,30 @@ exports.expressPreSession = async (hookName:string, {app}:any) => {
 
           // read form data if method was POST
           let formData:MapArrayType<any> = {};
-          if (c.request.method === 'post') {
-            const form = new IncomingForm();
-            formData = (await form.parse(req))[0];
-            for (const k of Object.keys(formData)) {
-              if (formData[k] instanceof Array) {
-                formData[k] = formData[k][0];
+          if ((c.request.method || '').toLowerCase() === 'post') {
+            // If express.json() already parsed the body (application/json),
+            // use req.body directly. Formidable would hang waiting for an
+            // already-consumed stream, causing the request to time out.
+            if (req.body && typeof req.body === 'object') {
+              formData = req.body;
+            } else {
+              const form = new IncomingForm();
+              formData = (await form.parse(req))[0];
+              for (const k of Object.keys(formData)) {
+                if (formData[k] instanceof Array) {
+                  formData[k] = formData[k][0];
+                }
               }
             }
           }
 
-          const fields = Object.assign({}, headers, params, query, formData);
+          // Merge parameters with clear precedence: body > query > path params.
+          // Only pass the authorization header explicitly — don't merge all headers
+          // into fields to prevent parameter pollution.
+          const fields = Object.assign({}, params, query, formData);
+          if (headers.authorization) {
+            fields.authorization = fields.authorization || headers.authorization;
+          }
           if (logger.isDebugEnabled()) {
             logger.debug(`REQUEST, v${version}:${funcName}, ${JSON.stringify(fields)}`);
           }
@@ -725,13 +861,28 @@ exports.expressPreSession = async (hookName:string, {app}:any) => {
 const getApiRootForVersion = (version:string, style:any = APIPathStyle.FLAT): string => `/${style}/${version}`;
 
 /**
- * Helper to generate an OpenAPI server object when serving definitions
+ * Helper to generate an OpenAPI server object when serving definitions.
+ *
+ * Prefers `settings.publicURL` when configured — it is operator-trusted and not
+ * derived from client-controlled headers. Otherwise it falls back to the
+ * request's scheme + Host, hardening both: the scheme is capped to http/https
+ * (a spoofed `X-Forwarded-Proto` can't smuggle a different scheme) and the Host
+ * is validated so a crafted/invalid `Host` header can't leak into the document.
  * @param {String} apiRoot The root path for the API version
  * @param {Request} req The express request object
  * @return {url: String} The server object for the OpenAPI definition location
  */
 const generateServerForApiVersion = (apiRoot:string, req:any): {
   url:string
-} => ({
-  url: `${settings.ssl ? 'https' : 'http'}://${req.headers.host}${apiRoot}`,
-});
+} => {
+  const publicURL = sanitizePublicURL(settings.publicURL);
+  if (publicURL) return {url: `${publicURL}${apiRoot}`};
+
+  const proto = req.protocol === 'https' ? 'https' : 'http';
+  const host = sanitizeHost(req.get && req.get('host')) || 'localhost';
+  return {url: `${proto}://${host}${apiRoot}`};
+};
+
+exports.generateDefinitionForVersion = generateDefinitionForVersion;
+exports.APIPathStyle = APIPathStyle;
+exports.generateServerForApiVersion = generateServerForApiVersion;

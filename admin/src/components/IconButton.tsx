@@ -1,16 +1,14 @@
-import {FC, JSX, ReactElement} from "react";
+import {ButtonHTMLAttributes, FC, JSX, ReactElement} from "react";
 
-export type IconButtonProps = {
-    icon: JSX.Element,
-    title: string|ReactElement,
-    onClick: ()=>void,
-    className?: string,
-    disabled?: boolean
+export type IconButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'title' | 'onClick'> & {
+  icon: JSX.Element,
+  title: string|ReactElement,
+  onClick: ()=>void,
 }
 
-export const IconButton:FC<IconButtonProps> = ({icon,className,onClick,title, disabled})=>{
-    return <button onClick={onClick} className={"icon-button "+ className} disabled={disabled}>
-        {icon}
-        <span>{title}</span>
-        </button>
-}
+export const IconButton: FC<IconButtonProps> = ({icon, className, onClick, title, type = 'button', ...rest}) => (
+  <button {...rest} type={type} onClick={onClick} className={"icon-button " + (className ?? "")}>
+    {icon}
+    <span>{title}</span>
+  </button>
+);

@@ -34,7 +34,7 @@ describe(__filename, function () {
       plugins.hooks[hookName] = [];
     }
     backups.settings = {};
-    for (const setting of ['editOnly', 'requireAuthentication', 'requireAuthorization', 'users']) {
+    for (const setting of ['editOnly', 'requireAuthentication', 'requireAuthorization', 'users', 'enablePadWideSettings', 'allowPadDeletionByAllUsers']) {
       // @ts-ignore
       backups.settings[setting] = settings[setting];
     }
@@ -322,6 +322,338 @@ describe(__filename, function () {
       const message = await common.handshake(socket, 'pad');
       assert.equal(message.accessStatus, 'deny');
     });
+  });
+
+  describe('Duplicate-author handling (#7656)', function () {
+    let socketA: any;
+    let socketB: any;
+
+    afterEach(async function () {
+      for (const s of [socketA, socketB]) if (s) s.close();
+      socketA = null;
+      socketB = null;
+      // The outer afterEach only knows about the singleton `socket`. Null it so
+      // it doesn't try to close one of ours twice.
+      socket = null;
+    });
+
+    // Records `{disconnect: ...}` payloads delivered to a socket so a test can
+    // assert whether the userdup kick fired.
+    const watchDisconnects = (s: any): string[] => {
+      const seen: string[] = [];
+      s.on('message', (msg: any) => { if (msg && msg.disconnect) seen.push(msg.disconnect); });
+      return seen;
+    };
+
+    it('cookie identity: same-author second socket kicks the first (regression)', async function () {
+      const res = await agent.get('/p/pad').expect(200);
+      socketA = await common.connect(res);
+      assert.equal((await common.handshake(socketA, 'pad')).type, 'CLIENT_VARS');
+      const seen = watchDisconnects(socketA);
+
+      // Same cookie => same author token => same authorID. This is the original
+      // "stale tab in the same browser" case the kick was designed for.
+      socketB = await common.connect(res);
+      assert.equal((await common.handshake(socketB, 'pad')).type, 'CLIENT_VARS');
+      // Let the kick emit drain.
+      await new Promise((r) => setTimeout(r, 200));
+      assert.deepEqual(seen, ['userdup']);
+    });
+
+    it('authenticated identity: second socket does NOT kick the first', async function () {
+      settings.requireAuthentication = true;
+      const res = await agent.get('/p/pad').auth('user', 'user-password').expect(200);
+      socketA = await common.connect(res);
+      assert.equal((await common.handshake(socketA, 'pad')).type, 'CLIENT_VARS');
+      const seen = watchDisconnects(socketA);
+
+      socketB = await common.connect(res);
+      assert.equal((await common.handshake(socketB, 'pad')).type, 'CLIENT_VARS');
+      await new Promise((r) => setTimeout(r, 200));
+      assert.deepEqual(seen, []);
+    });
+
+    // Records USER_LEAVE userIds so a test can assert whether other clients
+    // were told the author went offline.
+    const watchUserLeaves = (s: any): string[] => {
+      const seen: string[] = [];
+      s.on('message', (msg: any) => {
+        if (msg?.type === 'COLLABROOM' && msg?.data?.type === 'USER_LEAVE') {
+          seen.push(msg.data.userInfo?.userId);
+        }
+      });
+      return seen;
+    };
+
+    it('authenticated identity: closing one socket does NOT remove the author for the other', async function () {
+      // Two authenticated sockets sharing one identity (same authorID). When
+      // socketA closes, presence-key clients keyed on authorID would drop the
+      // author entirely if USER_LEAVE were broadcast — but socketB is still
+      // online. The server must only emit USER_LEAVE when the *last* socket
+      // for that author leaves.
+      settings.requireAuthentication = true;
+      const res = await agent.get('/p/pad').auth('user', 'user-password').expect(200);
+      socketA = await common.connect(res);
+      const cvA: any = await common.handshake(socketA, 'pad');
+      const authorIdA = cvA.data.userId;
+      socketB = await common.connect(res);
+      const cvB: any = await common.handshake(socketB, 'pad');
+      assert.equal(cvB.data.userId, authorIdA, 'precondition: same author');
+
+      const leaves = watchUserLeaves(socketB);
+      socketA.close();
+      socketA = null;
+      // Give the server a beat to broadcast.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(leaves, [],
+          'remaining same-author socket should not see USER_LEAVE for itself');
+    });
+
+    it('different authors: closing one socket DOES emit USER_LEAVE for the other (regression)', async function () {
+      // socketA and socketB are different anonymous browsers (separate cookie
+      // jars => separate authorIDs). Closing socketA must still tell socketB
+      // that authorA left.
+      const supertest = require('supertest');
+      const browserA = supertest(common.baseUrl);
+      const browserB = supertest(common.baseUrl);
+      const resA = await browserA.get('/p/pad').expect(200);
+      const resB = await browserB.get('/p/pad').expect(200);
+      socketA = await common.connect(resA);
+      const cvA: any = await common.handshake(socketA, 'pad');
+      socketB = await common.connect(resB);
+      const cvB: any = await common.handshake(socketB, 'pad');
+      assert.notEqual(cvA.data.userId, cvB.data.userId, 'precondition: different authors');
+
+      const leaves = watchUserLeaves(socketB);
+      socketA.close();
+      socketA = null;
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(leaves, [cvA.data.userId]);
+    });
+  });
+
+  describe('Pad-wide settings creator gate', function () {
+    let socketA: any;
+    let socketB: any;
+
+    const removeIfExists = async (padId: string) => {
+      if (await padManager.doesPadExist(padId)) {
+        const p = await padManager.getPad(padId);
+        await p.remove();
+      }
+    };
+
+    beforeEach(async function () {
+      // @ts-ignore - test toggles a public setting
+      settings.enablePadWideSettings = true;
+      await removeIfExists('foo');
+    });
+
+    afterEach(async function () {
+      for (const s of [socketA, socketB]) if (s) s.close();
+      socketA = null;
+      socketB = null;
+      socket = null;
+      await removeIfExists('foo');
+    });
+
+    it('different browsers (separate cookie jars): only the creator gets canEditPadSettings', async function () {
+      const supertest = require('supertest');
+      const browserA = supertest(common.baseUrl);
+      const browserB = supertest(common.baseUrl);
+
+      const resA = await browserA.get('/p/foo').expect(200);
+      socketA = await common.connect(resA);
+      const cvA = await common.handshake(socketA, 'foo');
+      assert.equal(cvA.data.canEditPadSettings, true,
+          'first joiner (creator) should see Pad-wide Settings');
+
+      const resB = await browserB.get('/p/foo').expect(200);
+      socketB = await common.connect(resB);
+      const cvB = await common.handshake(socketB, 'foo');
+      assert.equal(cvB.data.canEditPadSettings, false,
+          'non-creator joiner must NOT see Pad-wide Settings');
+    });
+
+    it('same browser two tabs (shared cookie jar): BOTH get canEditPadSettings=true', async function () {
+      // Reusing the same response (and its set-cookie header) for both
+      // connects is the backend equivalent of two browser tabs sharing the
+      // same HttpOnly token cookie — same authorID, same creator.
+      const res = await agent.get('/p/foo').expect(200);
+
+      socketA = await common.connect(res);
+      const cvA = await common.handshake(socketA, 'foo');
+      assert.equal(cvA.data.canEditPadSettings, true);
+
+      socketB = await common.connect(res);
+      const cvB = await common.handshake(socketB, 'foo');
+      assert.equal(cvB.data.canEditPadSettings, true,
+          'same author across tabs is one identity, both are the creator');
+    });
+  });
+
+  describe('Pad deletion token issuance (#7926)', function () {
+    let getAuthorIdBackup: any;
+
+    const removeIfExists = async (padId: string) => {
+      if (await padManager.doesPadExist(padId)) {
+        const p = await padManager.getPad(padId);
+        await p.remove();
+      }
+    };
+
+    // A getAuthorId hook that pins authorID to the authenticated username — the
+    // documented way (doc/api/hooks_server-side) to give a user a stable
+    // identity across cookie clears and devices. Its mere presence is what makes
+    // an authenticated session "durable" for token-suppression purposes.
+    const installStableIdentityHook = () => {
+      plugins.hooks.getAuthorId = [{hook_fn: async (hookName: string, context: any) => {
+        const username = context.user && context.user.username;
+        if (!username) return;
+        context.dbKey = `username=${username}`;
+        return '';
+      }}];
+    };
+
+    beforeEach(async function () {
+      // @ts-ignore - public setting toggled per test
+      settings.allowPadDeletionByAllUsers = false;
+      // The outer harness only backs up preAuthorize/authenticate/authorize, so
+      // manage getAuthorId ourselves to avoid leaking it into later specs.
+      getAuthorIdBackup = plugins.hooks.getAuthorId;
+      plugins.hooks.getAuthorId = [];
+      await removeIfExists('pad');
+    });
+    afterEach(async function () {
+      if (socket) socket.close();
+      socket = null;
+      plugins.hooks.getAuthorId = getAuthorIdBackup;
+      await removeIfExists('pad');
+    });
+
+    it('anonymous creator receives a deletion token by default', async function () {
+      const res = await agent.get('/p/pad').expect(200);
+      socket = await common.connect(res);
+      const cv: any = await common.handshake(socket, 'pad');
+      assert.equal(cv.type, 'CLIENT_VARS');
+      assert.equal(typeof cv.data.padDeletionToken, 'string',
+          'creator should get a token so the client can show the save-token modal');
+      assert.ok(cv.data.padDeletionToken.length >= 32);
+      assert.equal(cv.data.canDeleteWithoutToken, false);
+      // The creator can always delete without a token on this device, so the
+      // plain "Delete pad" button is offered (issue #7959).
+      assert.equal(cv.data.canDeletePad, true);
+    });
+
+    it('no token (and so no modal) when allowPadDeletionByAllUsers is true', async function () {
+      // @ts-ignore - public setting
+      settings.allowPadDeletionByAllUsers = true;
+      const res = await agent.get('/p/pad').expect(200);
+      socket = await common.connect(res);
+      const cv: any = await common.handshake(socket, 'pad');
+      assert.equal(cv.type, 'CLIENT_VARS');
+      // A null token means showDeletionTokenModalIfPresent() returns early on the
+      // client, so the "Save your pad deletion token" modal never appears. Anyone
+      // can already delete the pad without a token in this configuration.
+      assert.equal(cv.data.padDeletionToken, null);
+      assert.equal(cv.data.canDeleteWithoutToken, true);
+      assert.equal(cv.data.canDeletePad, true);
+    });
+
+    it('non-creator gets canDeletePad=false by default, true under allowPadDeletionByAllUsers (#7959)',
+        async function () {
+          const supertest = require('supertest');
+          // The creator (default cookie jar) establishes the pad's rev-0 author.
+          const resCreator = await agent.get('/p/pad').expect(200);
+          socket = await common.connect(resCreator);
+          const cvCreator: any = await common.handshake(socket, 'pad');
+          assert.equal(cvCreator.data.canDeletePad, true, 'creator can always delete');
+
+          // A different browser (separate cookie jar) is NOT the creator, so with
+          // allowPadDeletionByAllUsers off it must not be offered the token-less
+          // Delete pad button.
+          const otherBrowser = supertest(common.baseUrl);
+          const resOther = await otherBrowser.get('/p/pad').expect(200);
+          const otherSocket = await common.connect(resOther);
+          try {
+            const cvOther: any = await common.handshake(otherSocket, 'pad');
+            assert.equal(cvOther.data.canDeletePad, false,
+                'non-creator must not see Delete pad by default');
+          } finally {
+            otherSocket.close();
+          }
+
+          // With everyone opted in, the same non-creator CAN delete, so the
+          // button must be offered — independent of enablePadWideSettings (#7959).
+          // @ts-ignore - public setting toggled per test
+          settings.allowPadDeletionByAllUsers = true;
+          const otherBrowser2 = supertest(common.baseUrl);
+          const resOther2 = await otherBrowser2.get('/p/pad').expect(200);
+          const otherSocket2 = await common.connect(resOther2);
+          try {
+            const cvOther2: any = await common.handshake(otherSocket2, 'pad');
+            assert.equal(cvOther2.data.canDeletePad, true,
+                'allowPadDeletionByAllUsers must offer Delete pad to everyone');
+          } finally {
+            otherSocket2.close();
+          }
+        });
+
+    it('readonly viewer is denied canDeletePad and token-less deletion under allowPadDeletionByAllUsers (#7959)',
+        async function () {
+          // @ts-ignore - public setting toggled per test
+          settings.allowPadDeletionByAllUsers = true;
+          // Creator establishes the pad (rev-0 author) and yields its read-only id.
+          const resCreator = await agent.get('/p/pad').expect(200);
+          const creatorSocket = await common.connect(resCreator);
+          const cvCreator: any = await common.handshake(creatorSocket, 'pad');
+          const readOnlyId = cvCreator.data.readOnlyId;
+          assert.ok(readOnlyManager.isReadOnlyId(readOnlyId));
+          creatorSocket.close();
+
+          // A read-only viewer must NOT be offered the token-less delete button,
+          // even with deletion opened to all users — readonly viewers cannot edit,
+          // let alone delete (issue #7959).
+          const resRo = await agent.get(`/p/${readOnlyId}`).expect(200);
+          socket = await common.connect(resRo);
+          const cvRo: any = await common.handshake(socket, readOnlyId);
+          assert.equal(cvRo.data.readonly, true);
+          assert.equal(cvRo.data.canDeletePad, false,
+              'readonly viewers must not get the token-less Delete pad button');
+
+          // ...and the server must refuse a token-less PAD_DELETE from a readonly
+          // session, or allowPadDeletionByAllUsers becomes a data-loss hole.
+          await common.sendPadDelete(socket, {padId: 'pad'}).catch(() => {});
+          assert.ok(await padManager.doesPadExist('pad'),
+              'readonly session must not be able to delete the pad without a token');
+        });
+
+    it('authenticated creator WITHOUT a getAuthorId hook still gets a token', async function () {
+      // requireAuthentication alone is NOT durable: the authorID still comes from
+      // the per-browser token cookie, so this user would be stranded on a second
+      // device if the token were withheld. They must keep getting one.
+      settings.requireAuthentication = true;
+      const res = await agent.get('/p/pad').auth('user', 'user-password').expect(200);
+      socket = await common.connect(res);
+      const cv: any = await common.handshake(socket, 'pad');
+      assert.equal(cv.type, 'CLIENT_VARS');
+      assert.equal(typeof cv.data.padDeletionToken, 'string');
+      assert.equal(cv.data.canDeleteWithoutToken, false);
+      assert.equal(cv.data.canDeletePad, true);
+    });
+
+    it('authenticated creator WITH a getAuthorId hook gets no token (durable identity)',
+        async function () {
+          settings.requireAuthentication = true;
+          installStableIdentityHook();
+          const res = await agent.get('/p/pad').auth('user', 'user-password').expect(200);
+          socket = await common.connect(res);
+          const cv: any = await common.handshake(socket, 'pad');
+          assert.equal(cv.type, 'CLIENT_VARS');
+          assert.equal(cv.data.padDeletionToken, null);
+          assert.equal(cv.data.canDeleteWithoutToken, true);
+          assert.equal(cv.data.canDeletePad, true);
+        });
   });
 
   describe('SocketIORouter.js', function () {

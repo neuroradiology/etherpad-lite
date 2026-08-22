@@ -98,7 +98,7 @@ Portal submits content into new blog post
 ## Usage
 
 ### API version
-The latest version is `1.2.15`
+The latest version is `1.3.1`
 
 The current version can be queried via /api.
 
@@ -305,6 +305,18 @@ Returns the Author Name of the author
 * `{code: 0, message:"ok", data: {authorName: "John McLear"}}`
 
 -> can't be deleted cause this would involve scanning all the pads where this author was
+
+#### anonymizeAuthor(authorID)
+* API >= 1.3.1
+
+Erases an author's identity across all pads they contributed to (GDPR Article 17, the "right to erasure"). The author's name and external/token mappings are removed and their chat messages are cleared, so the author can no longer be re-identified from pad data.
+
+This endpoint is **disabled by default** and is gated on `gdprAuthorErasure.enabled = true` in `settings.json`. If GDPR author erasure is not enabled, the call returns an error and performs no changes. See [doc/privacy.md](../privacy.md) for the privacy/data-retention context.
+
+*Example returns:*
+* `{code: 0, message:"ok", data: {affectedPads: 3, removedTokenMappings: 1, removedExternalMappings: 1, clearedChatMessages: 7}}`
+* `{code: 1, message:"anonymizeAuthor is disabled — set gdprAuthorErasure.enabled = true in settings.json to enable GDPR Art. 17 erasure", data: null}`
+* `{code: 1, message:"authorID is required", data: null}`
 
 ### Session
 Sessions can be created between a group and an author. This allows an author to access more than one group. The sessionID will be set as a cookie to the client and is valid until a certain date. The session cookie can also contain multiple comma-separated sessionIDs, allowing a user to edit pads in different groups at the same time. Only users with a valid session for this group, can access group pads. You can create a session after you authenticated the user at your web application, to give them access to the pads. You should save the sessionID of this session and delete it after the user logged out.
@@ -519,12 +531,20 @@ Group pads are normal pads, but with the name schema GROUPID$PADNAME. A security
 #### createPad(padID, [text], [authorId])
 * API >= 1
 * `authorId` in API >= 1.3.0
+* returns `deletionToken` once, since the same release that added `allowPadDeletionByAllUsers`
 
 creates a new (non-group) pad.  Note that if you need to create a group Pad, you should call **createGroupPad**.
 You get an error message if you use one of the following characters in the padID: "/", "?", "&" or "#".
 
+`data.deletionToken` is a one-shot recovery token tied to this pad. It is
+returned in plaintext on the first call for a given padID and is `null` on
+subsequent calls (the token itself is stored on the server as a sha256 hash).
+Pass it to **deletePad** (or the socket `PAD_DELETE` message) to delete the
+pad without the creator's author cookie.
+
 *Example returns:*
-* `{code: 0, message:"ok", data: null}`
+* `{code: 0, message:"ok", data: {deletionToken: "…32-char random string…"}}`
+* `{code: 0, message:"ok", data: {deletionToken: null}}` — pad already existed
 * `{code: 1, message:"padID does already exist", data: null}`
 * `{code: 1, message:"malformed padID: Remove special characters", data: null}`
 
@@ -581,17 +601,27 @@ returns the list of users that are currently editing this pad
 * `{code: 0, message:"ok", data: {padUsers: [{colorId:"#c1a9d9","name":"username1","timestamp":1345228793126,"id":"a.n4gEeMLsvg12452n"},{"colorId":"#d9a9cd","name":"Hmmm","timestamp":1345228796042,"id":"a.n4gEeMLsvg12452n"}]}}`
 * `{code: 0, message:"ok", data: {padUsers: []}}`
 
-#### deletePad(padID)
+#### deletePad(padID, [deletionToken])
 * API >= 1
+* `deletionToken` in the same release as `allowPadDeletionByAllUsers`
 
-deletes a pad
+deletes a pad.
+
+`deletionToken` is the one-shot recovery token returned by `createPad` /
+`createGroupPad`. An apikey-authenticated caller can pass any (or no) token
+and the call still succeeds — trusted admins bypass the check. An
+unauthenticated caller (or a caller that explicitly passes a wrong token)
+is rejected with `invalid deletionToken` unless the operator has set
+`allowPadDeletionByAllUsers: true` in `settings.json`, in which case the
+token is ignored.
 
 *Example returns:*
 * `{code: 0, message:"ok", data: null}`
 * `{code: 1, message:"padID does not exist", data: null}`
+* `{code: 1, message:"invalid deletionToken", data: null}`
 
 #### copyPad(sourceID, destinationID[, force=false])
-* API >= 1.2.8
+* API >= 1.2.9
 
 copies a pad with full history and chat. If force is true and the destination pad exists, it will be overwritten.
 
@@ -611,13 +641,38 @@ Note that all the revisions will be lost! In most of the cases one should use `c
 * `{code: 1, message:"padID does not exist", data: null}`
 
 #### movePad(sourceID, destinationID[, force=false])
-* API >= 1.2.8
+* API >= 1.2.9
 
 moves a pad. If force is true and the destination pad exists, it will be overwritten.
+
+A move is a rename, so the pad's `deletionToken` travels with it: the token
+issued for `sourceID` keeps working against `destinationID`, and the creator is
+not handed a second token when they open the renamed pad. When `force`
+overwrites an existing destination pad, that pad's own token is discarded along
+with its content. **copyPad** does not do this — a copy is a separate pad and
+gets its own token.
 
 *Example returns:*
 * `{code: 0, message:"ok", data: null}`
 * `{code: 1, message:"padID does not exist", data: null}`
+
+#### compactPad(padID, [keepRevisions])
+* API >= 1.3.1
+
+collapses the pad's revision history to reclaim database space (issue #6194). Wraps the same `Cleanup` helper that powers the admin-settings UI, so admins can trigger compaction over the public API or via `bin/compactPad` without going through the admin UI.
+
+**Gated on `settings.cleanup.enabled = true`** (matches the admin/Cleanup path). The endpoint returns an error if cleanup isn't enabled in `settings.json`, so the public API can't bypass the same opt-in switch the admin UI requires.
+
+When `keepRevisions` is omitted (or null), all history is collapsed into a single base revision that reproduces the current pad text — equivalent to a freshly-imported pad. When set to a positive integer N, the pad keeps only its last N revisions.
+
+Pad text and chat are preserved in both modes. Saved-revision bookmarks are cleared. **This operation is destructive — export the pad first (for example via the `/p/:padID/export/etherpad` export endpoint) if you need a full-history backup.**
+
+*Example returns:*
+* `{code: 0, message:"ok", data: {ok: true, mode: "all"}}`
+* `{code: 0, message:"ok", data: {ok: true, mode: "keepLast", keepRevisions: 50}}`
+* `{code: 1, message:"padID does not exist", data: null}`
+* `{code: 1, message:"keepRevisions must be a non-negative integer", data: null}`
+* `{code: 1, message:"compactPad requires cleanup.enabled = true in settings.json", data: null}`
 
 #### getReadOnlyID(padID)
 * API >= 1
@@ -628,10 +683,10 @@ returns the read only link of a pad
 * `{code: 0, message:"ok", data: {readOnlyID: "r.s8oes9dhwrvt0zif"}}`
 * `{code: 1, message:"padID does not exist", data: null}`
 
-#### getPadID(readOnlyID)
+#### getPadID(roID)
 * API >= 1.2.10
 
-returns the id of a pad which is assigned to the readOnlyID
+returns the id of the pad mapped to the given read-only id. The query parameter is named `roID` (the read-only id returned by `getReadOnlyID`).
 
 *Example returns:*
 * `{code: 0, message:"ok", data: {padID: "p.s8oes9dhwrvt0zif"}}`
@@ -661,6 +716,8 @@ return true of false
 * API >= 1
 
 returns an array of authors who contributed to this pad
+
+The synthetic `a.etherpad-system` author (used internally when content is inserted without an explicit `authorId` — HTTP API `setText`/`appendText`/`setHTML` calls without `authorId`, server-side imports, plugins like `ep_post_data`) is omitted from the returned list.
 
 *Example returns:*
 * `{code: 0, message:"ok", data: {authorIDs : ["a.s8oes9dhwrvt0zif", "a.akf8finncvomlqva"]}`
@@ -725,4 +782,25 @@ get stats of the etherpad instance
 ```json
 {"code":0,"message":"ok","data":{"totalPads":3,"totalSessions": 2,"totalActivePads": 1}}
 ```
+
+#### `GET /api/version-status`
+
+Returns an outdated-version signal intended for the pad-side gritter.
+
+**Query parameters:**
+
+| name    | type   | required | description                                                                 |
+| ------- | ------ | -------- | --------------------------------------------------------------------------- |
+| `padId` | string | no       | Pad whose first-author membership is being checked.                         |
+
+**Response 200 (`application/json`):**
+
+```json
+{
+  "outdated": "minor",
+  "isFirstAuthor": true
+}
+```
+
+`outdated` is `"minor"` only when the running server is at least one minor version behind the latest published release AND the request resolves to the pad's first author. Otherwise it is `null`. Result is cached per `(padId, authorId)` for 60s. The endpoint is disabled entirely when `updates.tier = 'off'`.
 

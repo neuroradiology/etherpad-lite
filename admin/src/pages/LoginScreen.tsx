@@ -3,59 +3,61 @@ import {useNavigate} from "react-router-dom";
 import {SubmitHandler, useForm} from "react-hook-form";
 import {Eye, EyeOff} from "lucide-react";
 import {useState} from "react";
+import {useTranslation} from "react-i18next";
 
 type Inputs = {
-    username: string
-    password: string
+  username: string
+  password: string
 }
 
 export const LoginScreen = ()=>{
-    const navigate = useNavigate()
-    const [passwordVisible, setPasswordVisible] = useState<boolean>(false)
+  const navigate = useNavigate()
+  const [passwordVisible, setPasswordVisible] = useState<boolean>(false)
+  const {t} = useTranslation()
 
-    const {
-        register,
-        handleSubmit} = useForm<Inputs>()
+  const {
+    register,
+    handleSubmit} = useForm<Inputs>()
 
-    const login: SubmitHandler<Inputs> = ({username,password})=>{
-        fetch('/admin-auth/', {
-            method: 'POST',
-            headers:{
-                Authorization: `Basic ${btoa(`${username}:${password}`)}`
-            }
-        }).then(r=>{
-            if(!r.ok) {
-                useStore.getState().setToastState({
-                    open: true,
-                    title: "Login failed",
-                    success: false
-                })
-            } else {
-                navigate('/')
-            }
-        }).catch(e=>{
-            console.error(e)
+  const login: SubmitHandler<Inputs> = ({username,password})=>{
+    fetch('/admin-auth/', {
+      method: 'POST',
+      headers:{
+        Authorization: `Basic ${btoa(`${username}:${password}`)}`
+      }
+    }).then(r=>{
+      if(!r.ok) {
+        useStore.getState().setToastState({
+          open: true,
+          title: t('admin_login.failed'),
+          success: false
         })
-    }
+      } else {
+        navigate('/')
+      }
+    }).catch(e=>{
+      console.error(e)
+    })
+  }
 
-    return <div className="login-background login-page">
-        <div className="login-box login-form">
-            <h1 className="login-title">Etherpad</h1>
-            <form className="login-inner-box input-control" onSubmit={handleSubmit(login)}>
-                <div>Username</div>
-                <input {...register('username', {
-                    required: true
-                })} className="login-textinput input-control" type="text" placeholder="Username"/>
-                <div>Password</div>
-                <span className="icon-input">
-                        <input {...register('password', {
-                            required: true
-                        })} className="login-textinput" type={passwordVisible?"text":"password"} placeholder="Password"/>
-                    {passwordVisible? <Eye onClick={()=>setPasswordVisible(!passwordVisible)}/> :
-                        <EyeOff onClick={()=>setPasswordVisible(!passwordVisible)}/>}
-                    </span>
-                <input type="submit" value="Login" className="login-button"/>
-            </form>
-        </div>
+  return <div className="login-background login-page">
+    <div className="login-box login-form">
+      <h1 className="login-title">{t('admin_login.title')}</h1>
+      <form className="login-inner-box input-control" onSubmit={handleSubmit(login)}>
+        <div>{t('admin_login.username')}</div>
+        <input {...register('username', {
+          required: true
+        })} className="login-textinput input-control" type="text" placeholder={t('admin_login.username')}/>
+        <div>{t('admin_login.password')}</div>
+        <span className="icon-input">
+            <input {...register('password', {
+              required: true
+            })} className="login-textinput" type={passwordVisible?"text":"password"} placeholder={t('admin_login.password')}/>
+          {passwordVisible? <Eye onClick={()=>setPasswordVisible(!passwordVisible)}/> :
+            <EyeOff onClick={()=>setPasswordVisible(!passwordVisible)}/>}
+          </span>
+        <input type="submit" value={t('admin_login.submit')} className="login-button"/>
+      </form>
     </div>
+  </div>
 }

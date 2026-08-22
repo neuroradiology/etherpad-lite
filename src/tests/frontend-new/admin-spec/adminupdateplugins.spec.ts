@@ -1,6 +1,11 @@
 import {expect, test} from "@playwright/test";
 import {loginToAdmin} from "../helper/adminhelper";
 
+// Install/uninstall mutates global server state (installed plugin set) that
+// all admin tests observe. Run these serially so one test's install can't
+// leak into another test's assertions.
+test.describe.configure({ mode: 'serial' });
+
 test.beforeEach(async ({ page })=>{
     await loginToAdmin(page, 'admin', 'changeme1');
     await page.goto('http://localhost:9001/admin/plugins')
@@ -10,58 +15,52 @@ test.beforeEach(async ({ page })=>{
 test.describe('Plugins page',  ()=> {
 
     test('List some plugins', async ({page}) => {
-        await page.waitForSelector('.search-field');
-        const pluginTable =  page.locator('table tbody').nth(1);
+        await page.waitForSelector('.pm-search-input');
+        // Installed plugins are now a flex list; available plugins are in the sole <table>
+        const pluginTable = page.locator('table tbody').first();
         await expect(pluginTable).not.toBeEmpty()
     })
 
     test('Searches for a plugin', async ({page}) => {
-        await page.waitForSelector('.search-field');
-        await page.click('.search-field')
-        await page.keyboard.type('ep_font_color')
-        await page.keyboard.press('Enter')
-        const pluginTable =  page.locator('table tbody').nth(1);
-        await expect(pluginTable.locator('tr')).toHaveCount(1)
-        await expect(pluginTable.locator('tr').first()).toContainText('ep_font_color')
+        await page.waitForSelector('.pm-search-input');
+        await page.click('.pm-search-input')
+        await page.keyboard.type('ep_set_title_on_pad')
+        const pluginTable = page.locator('table tbody').first();
+        await expect(pluginTable.locator('tr').first()).toContainText('ep_set_title_on_pad', {timeout: 60000})
     })
 
 
     test('Attempt to Install and Uninstall a plugin', async ({page}) => {
-        await page.waitForSelector('.search-field');
-        const pluginTable =  page.locator('table tbody').nth(1);
+        await page.waitForSelector('.pm-search-input');
+        const pluginTable = page.locator('table tbody').first();
         await expect(pluginTable).not.toBeEmpty({
             timeout: 15000
         })
 
         // Now everything is loaded, lets install a plugin
 
-        await page.click('.search-field')
-        await page.keyboard.type('ep_font_color')
+        await page.click('.pm-search-input')
+        await page.keyboard.type('ep_set_title_on_pad')
         await page.keyboard.press('Enter')
 
-        await expect(pluginTable.locator('tr')).toHaveCount(1)
+        await expect(pluginTable.locator('tr')).toHaveCount(1, {timeout: 60000})
         const pluginRow = pluginTable.locator('tr').first()
-        await expect(pluginRow).toContainText('ep_font_color')
+        await expect(pluginRow).toContainText('ep_set_title_on_pad', {timeout: 60000})
 
-        // Select Installation button
-        await pluginRow.locator('td').nth(4).locator('button').first().click()
-        await page.waitForTimeout(100)
-        await page.waitForSelector('table tbody')
-        const installedPlugins = page.locator('table tbody').first()
-        const installedPluginsRows = installedPlugins.locator('tr')
-        await expect(installedPluginsRows).toHaveCount(2, {
-            timeout: 15000
-        })
+        // Install button is in the last table cell
+        await pluginRow.locator('td').last().locator('button').first().click()
+        await page.waitForSelector('.pm-installed')
 
-        const installedPluginRow = installedPluginsRows.nth(1)
+        // Installed plugins are now in .pm-installed-row flex items (not a table).
+        // Assert by name rather than by row count — transitive deps may also appear.
+        const installedPluginRow = page.locator('.pm-installed-row', {hasText: 'ep_set_title_on_pad'})
+        await expect(installedPluginRow).toHaveCount(1, {timeout: 15000})
 
-        await expect(installedPluginRow).toContainText('ep_font_color')
-        await installedPluginRow.locator('td').nth(2).locator('button').first().click()
+        // Uninstall button is inside .pm-installed-actions
+        await installedPluginRow.locator('.pm-installed-actions button').first().click()
 
-        // Wait for the uninstallation to complete
-        await expect(installedPluginsRows).toHaveCount(1, {
-            timeout: 15000
-        })
+        // Wait for the uninstallation to complete: the row should disappear.
+        await expect(installedPluginRow).toHaveCount(0, {timeout: 15000})
         await page.waitForTimeout(5000)
     })
 })

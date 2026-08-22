@@ -1,8 +1,12 @@
 # Contributor Guidelines
-(Please talk to people on the mailing list before you change this page, see our section on [how to get in touch](https://github.com/ether/etherpad-lite#get-in-touch))
+(Please talk to people on the mailing list before you change this page, see our section on [how to get in touch](https://github.com/ether/etherpad#get-in-touch))
+
+**We have decided that LLM/Agent/AI contributions are fine as long as they are within the instructions set out by this document.**
 
 ## Pull requests
 
+* PRs MUST include a non-empty description explaining what the change does and why
+* PRs without a description should be flagged as incomplete
 * the commit series in the PR should be _linear_ (it **should not contain merge commits**). This is necessary because we want to be able to [bisect](https://en.wikipedia.org/wiki/Bisection_(software_engineering)) bugs easily. Rewrite history/perform a rebase if necessary
 * PRs should be issued against the **develop** branch: we never pull directly into **master**
 * PRs **should not have conflicts** with develop. If there are, please resolve them rebasing and force-pushing
@@ -81,7 +85,7 @@ Also, keep it maintainable. We don't wanna end up as the monster Etherpad was!
 ## Coding style
 * Do write comments. (You don't have to comment every line, but if you come up with something that's a bit complex/weird, just leave a comment. Bear in mind that you will probably leave the project at some point and that other people will read your code. Undocumented huge amounts of code are worthless!)
 * Never ever use tabs
-* Indentation: JS/CSS: 2 spaces; HTML: 4 spaces
+* Indentation: 2 spaces
 * Don't overengineer. Don't try to solve any possible problem in one step, but try to solve problems as easy as possible and improve the solution over time!
 * Do generalize sooner or later! (if an old solution, quickly hacked together, poses more problems than it solves today, refactor it!)
 * Keep it compatible. Do not introduce changes to the public API, db schema or configurations too lightly. Don't make incompatible changes without good reasons!
@@ -121,7 +125,7 @@ Documentation should be kept up-to-date. This means, whenever you add a new API 
 You can build the docs e.g. produce html, using `make docs`. At some point in the future we will provide an online documentation. The current documentation in the github wiki should always reflect the state of `master` (!), since there are no docs in master, yet.
 
 ## Testing
-Front-end tests are found in the `tests/frontend/` folder in the repository. Run them by pointing your browser to `<yourdomainhere>/tests/frontend`.
+Front-end tests are found in the `src/tests/frontend/` folder in the repository. Run them by pointing your browser to `<yourdomainhere>/tests/frontend`.
 
 Back-end tests can be run from the `src` directory, via `npm test`.
 You can use `npm test -- --inspect-brk` and navigate to `edge://inspect` or `chrome://inspect` to debug the tests.
@@ -138,5 +142,5 @@ Etherpad is much more than software.  So if you aren't a developer then worry no
  * Write proposals for grants
  * Co-Author and Publish CVEs
  * Work with SFC to maintain legal side of project
- * Maintain TODO page - https://github.com/ether/etherpad-lite/wiki/TODO#IMPORTANT_TODOS
+ * Maintain TODO page - https://github.com/ether/etherpad/wiki/TODO#IMPORTANT_TODOS
 

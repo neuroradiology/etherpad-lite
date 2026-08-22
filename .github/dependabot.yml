@@ -18,3 +18,18 @@ updates:
     groups:
       dev-dependencies:
         dependency-type: "development"
+    ignore:
+      # openapi-typescript's peer range is typescript@^5.x and it builds its
+      # output with the TypeScript *compiler API*, which TypeScript 7 (the
+      # native port) no longer exposes. admin/tools/openapi-codegen pins it to
+      # 6.x on purpose (see its README); a semver-major bump there re-breaks
+      # `gen:api`. Review TS major bumps manually instead.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+    cooldown:
+      default-days: 1        # fallback for anything not covered below
+      semver-major-days: 7
+      semver-minor-days: 3
+      semver-patch-days: 1
+      include:
+        - "*"

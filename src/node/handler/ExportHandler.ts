@@ -23,6 +23,7 @@
 const exporthtml = require('../utils/ExportHtml');
 const exporttxt = require('../utils/ExportTxt');
 const exportEtherpad = require('../utils/ExportEtherpad');
+import crypto from 'node:crypto';
 import fs from 'fs';
 import settings from '../utils/Settings';
 import os from 'os';
@@ -44,6 +45,15 @@ const tempDirectory = os.tmpdir();
  * @param {String} type the type to export
  */
 exports.doExport = async (req: any, res: any, padId: string, readOnlyId: string, type:string) => {
+  // Validate :rev BEFORE setting Content-Disposition. A bad rev causes
+  // checkValidRev to throw, which the route handler catches and renders as a
+  // plain-text 500. If we set the attachment header first, the browser would
+  // download the error message as a file instead of displaying it.
+  if (req.params.rev !== undefined) {
+    // modify req, as we use it in a later call to exportConvert
+    req.params.rev = checkValidRev(req.params.rev);
+  }
+
   // avoid naming the read-only file as the original pad's id
   let fileName = readOnlyId ? readOnlyId : padId;
 
@@ -58,16 +68,13 @@ exports.doExport = async (req: any, res: any, padId: string, readOnlyId: string,
   // tell the browser that this is a downloadable file
   res.attachment(`${fileName}.${type}`);
 
-  if (req.params.rev !== undefined) {
-    // ensure revision is a number
-    // modify req, as we use it in a later call to exportConvert
-    req.params.rev = checkValidRev(req.params.rev);
-  }
-
   // if this is a plain text export, we can do this directly
   // We have to over engineer this because tabs are stored as attributes and not plain text
   if (type === 'etherpad') {
-    const pad = await exportEtherpad.getPadRaw(padId, readOnlyId);
+    // Honor the :rev URL segment on `.etherpad` exports the same way the
+    // other formats already do — revNum limits the serialized pad to revs
+    // 0..rev (issue #5071).
+    const pad = await exportEtherpad.getPadRaw(padId, readOnlyId, req.params.rev);
     res.send(pad);
   } else if (type === 'txt') {
     const txt = await exporttxt.getPadTXTDocument(padId, req.params.rev);
@@ -87,15 +94,87 @@ exports.doExport = async (req: any, res: any, padId: string, readOnlyId: string,
       return;
     }
 
-    // else write the html export to a file
-    const randNum = Math.floor(Math.random() * 0xFFFFFFFF);
+    // Soffice-first dispatch (issue #7538). When soffice is configured
+    // we keep the legacy convert-via-tempfile path; when it's not, we
+    // hand DOCX to html-to-docx and PDF to our pdfkit walker — both
+    // pure-JS, in-process. No fallback chain: native errors surface as
+    // 5xx so admins see real failures instead of silent shadowing.
+    const {sofficeAvailable} = require('../utils/Settings');
+    const sofState = sofficeAvailable();
+    const goNative = sofState === 'no'
+        || (sofState === 'withoutPDF' && type === 'pdf');
+
+    if (goNative) {
+      const {
+        stripRemoteImages, extractBody, wrapLooseLines, dropEmptyBlocks,
+        applyMonospaceToCode,
+      } = require('../utils/ExportSanitizeHtml');
+      // The HTML pipeline returns a full document (head, style, body); the
+      // legacy soffice path renders that fine, but the in-process
+      // converters need just the body content to avoid leaking CSS into
+      // the output and to drop the document-level whitespace that creates
+      // stray paragraph breaks at the top of the result.
+      // dropEmptyBlocks strips heading-styled blank-line wrappers that
+      // ep_headings2 emits between every styled line.
+      const bodyHtml = dropEmptyBlocks(stripRemoteImages(extractBody(html)));
+      html = null;
+      try {
+        if (type === 'docx') {
+          // applyMonospaceToCode strips `<code>`/`<pre>`/`<tt>` wrappers
+          // (html-to-docx ignores them AND has a bug where it drops
+          // `<a href>` children of those tags) and emits styled
+          // monospace spans, forwarding any block-level alignment style
+          // to a wrapping `<p>`. Run BEFORE wrapLooseLines so the
+          // resulting `<p>` lands at the loose-line boundary instead
+          // of getting double-wrapped.
+          //
+          // wrapLooseLines then handles `<br>` semantics: bare `<br>`
+          // outside `<p>` becomes a soft break, `<br><br>` becomes a
+          // paragraph boundary plus blank-line markers.
+          const docxHtml = wrapLooseLines(applyMonospaceToCode(bodyHtml));
+          const htmlToDocx = require('html-to-docx');
+          const buf = await htmlToDocx(docxHtml);
+          res.contentType(
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+          res.send(buf);
+          return;
+        }
+        if (type === 'pdf') {
+          const {htmlToPdfBuffer} = require('../utils/ExportPdfNative');
+          const buf = await htmlToPdfBuffer(bodyHtml);
+          res.contentType('application/pdf');
+          res.send(buf);
+          return;
+        }
+        // soffice-only formats (odt, doc) are blocked at the route guard
+        // when soffice is null; reaching here means the guard is wrong.
+        res.status(500).send(`Cannot export ${type} without soffice configured`);
+        return;
+      } catch (err) {
+        console.error(
+            `native ${type} export failed for pad "${padId}":`,
+            err && (err as Error).stack ? (err as Error).stack : err);
+        res.status(500).send(`Failed to export pad as ${type}.`);
+        return;
+      }
+    }
+
+    // soffice path — write the html export to a file. Use CSPRNG output
+    // for the temp path token (see matching note in ImportHandler.ts).
+    const randNum = crypto.randomBytes(16).toString('hex');
     const srcFile = `${tempDirectory}/etherpad_export_${randNum}.html`;
-    await fsp_writeFile(srcFile, html);
+    // Strip remote <img> tags before handing the document to LibreOffice.
+    // soffice fetches remote image URLs during conversion, so any plugin/hook
+    // that injects an <img src="http://..."> into export HTML would otherwise
+    // turn export into a blind SSRF sink. The native path already does this
+    // (see stripRemoteImages above); apply it here so both paths match.
+    const {stripRemoteImages} = require('../utils/ExportSanitizeHtml');
+    await fsp_writeFile(srcFile, stripRemoteImages(html));
 
     // ensure html can be collected by the garbage collector
     html = null;
 
-    // send the convert job to the converter (abiword, libreoffice, ..)
+    // send the convert job to the converter (libreoffice)
     const destFile = `${tempDirectory}/etherpad_export_${randNum}.${type}`;
 
     // Allow plugins to overwrite the convert in export process
@@ -103,10 +182,7 @@ exports.doExport = async (req: any, res: any, padId: string, readOnlyId: string,
     if (result.length > 0) {
       // console.log("export handled by plugin", destFile);
     } else {
-      const converter =
-          settings.soffice != null ? require('../utils/LibreOffice')
-          : settings.abiword != null ? require('../utils/Abiword')
-          : null;
+      const converter = require('../utils/LibreOffice');
       await converter.convertFile(srcFile, destFile, type);
     }
 

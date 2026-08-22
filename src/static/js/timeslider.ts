@@ -27,18 +27,82 @@
 // assigns to the global `$` and augments it with plugins.
 require('./vendors/jquery');
 
-import {randomString, Cookies} from "./pad_utils";
+import {Cookies} from "./pad_utils";
 const hooks = require('./pluginfw/hooks');
 import padutils from './pad_utils'
 const socketio = require('./socketio');
 import html10n from '../js/vendors/html10n'
-let token, padId, exportLinks, socket, changesetLoader, BroadcastSlider;
+let padId, exportLinks, socket, changesetLoader, BroadcastSlider;
+let cp = '';
+const playbackSpeedCookie = 'timesliderPlaybackSpeed';
+
+const getPrefsCookieName = () => `${cp}${window.location.protocol === 'https:' ? 'prefs' : 'prefsHttp'}`;
+
+const readPadPrefs = () => {
+  try {
+    let json = Cookies.get(getPrefsCookieName());
+    if (json == null) {
+      const unprefixed = window.location.protocol === 'https:' ? 'prefs' : 'prefsHttp';
+      if (unprefixed !== getPrefsCookieName()) json = Cookies.get(unprefixed);
+    }
+    return json == null ? {} : JSON.parse(json);
+  } catch (err) {
+    return {};
+  }
+};
+
+const writePadPrefs = (prefs) => {
+  Cookies.set(getPrefsCookieName(), JSON.stringify(prefs), {expires: 365 * 100});
+};
+
+const setPadPref = (prefName, value) => {
+  const prefs = readPadPrefs();
+  prefs[prefName] = value;
+  writePadPrefs(prefs);
+};
+
+const applyShowLineNumbers = (showLineNumbers) => {
+  padutils.setCheckbox($('#options-linenoscheck'), showLineNumbers);
+  $('body').toggleClass('line-numbers-hidden', !showLineNumbers);
+  window.requestAnimationFrame(() => $(window).trigger('resize'));
+};
+
+const applyShowAuthorColors = (showAuthorColors) => {
+  $('#innerdocbody').toggleClass('authorColors', showAuthorColors);
+  $('#sidedivinner').toggleClass('authorColors', showAuthorColors);
+};
+
+// Pass '' (not null) to clear the rule — jQuery 3 ignores a null css value,
+// so the inline font-family would otherwise stick on reset.
+const applyPadFontFamily = (fontFamily) => {
+  $('#innerdocbody').css('font-family', fontFamily || '');
+};
 
 const init = () => {
   padutils.setupGlobalExceptionHandler();
   $(document).ready(() => {
     // start the custom js
     if (typeof customStart === 'function') customStart(); // eslint-disable-line no-undef
+
+    // Issue #7659: when this timeslider is mounted as the in-place history
+    // iframe inside a pad page, mark the body so CSS can hide the inner
+    // editbar (the outer pad's toolbar owns the slider) and inherit the
+    // parent's skin tokens so dark mode (and any other skinVariants the
+    // user toggled at runtime) is applied immediately on first paint.
+    // Direct visits to /p/:pad/timeslider?embed=1 (existing test/legacy
+    // entry points) keep their full chrome because parent === window.
+    try {
+      if (window.parent !== window) {
+        document.body.classList.add('iframe-mode');
+        const parentClasses = window.parent.document.documentElement.className || '';
+        const tokens = parentClasses.split(/\s+/).filter((c) =>
+            /^(super-light|light|dark|super-dark)-(toolbar|editor|background)$/.test(c) ||
+            c === 'full-width-editor');
+        if (tokens.length) {
+          document.documentElement.classList.add(...tokens);
+        }
+      }
+    } catch (_e) { /* cross-origin parent — leave defaults */ }
 
     // get the padId out of the url
     const urlParts = document.location.pathname.split('/');
@@ -47,14 +111,24 @@ const init = () => {
     // set the title
     document.title = `${padId.replace(/_+/g, ' ')} | ${document.title}`;
 
-    // ensure we have a token
-    token = Cookies.get('token');
-    if (token == null) {
-      token = `t.${randomString()}`;
-      Cookies.set('token', token, {expires: 60});
-    }
+    // The author token is an HttpOnly cookie set by the server on
+    // /p/:pad/timeslider (ether/etherpad#6701 PR3). The browser never reads
+    // or writes it; the server picks it up from the socket.io handshake.
+    cp = (window as any).clientVars?.cookiePrefix || '';
 
-    socket = socketio.connect(exports.baseURL, '/', {query: {padId}});
+    // Pass `embed` to the server when this timeslider is the in-place
+    // history iframe inside a pad page (issue #7659). Without this the
+    // server's duplicate-author kick treats the iframe's connection as a
+    // stale tab and disconnects the parent pad's live socket.
+    const embed = (() => {
+      try {
+        if (window.parent === window) return false;
+        const params = new URLSearchParams(window.location.search);
+        return params.get('embed') === '1';
+      } catch (_e) { return false; }
+    })();
+    socket = socketio.connect(
+        exports.baseURL, '/', {query: embed ? {padId, embed: '1'} : {padId}});
 
     // send the ready message once we're connected
     socket.on('connect', () => {
@@ -94,14 +168,15 @@ const init = () => {
 };
 
 // sends a message over the socket
+// The integrator-set `sessionID` cookie is consumed server-side from the
+// socket.io handshake (issue #7045). It does not need to ride on every
+// message; the server only reads it during CLIENT_READY.
 const sendSocketMsg = (type, data) => {
   socket.emit("message", {
     component: 'pad', // FIXME: Remove this stupidity!
     type,
     data,
     padId,
-    token,
-    sessionID: Cookies.get('sessionID'),
   });
 };
 
@@ -110,6 +185,7 @@ const fireWhenAllScriptsAreLoaded = [];
 const handleClientVars = (message) => {
   // save the client Vars
   window.clientVars = message.data;
+  cp = (window as any).clientVars?.cookiePrefix || '';
 
   if (window.clientVars.sessionRefreshInterval) {
     const ping =
@@ -128,6 +204,9 @@ const handleClientVars = (message) => {
   // load all script that doesn't work without the clientVars
   BroadcastSlider = require('./broadcast_slider')
       .loadBroadcastSliderJS(fireWhenAllScriptsAreLoaded);
+  // Exposed on window so the outer pad shell (issue #7659 in-place history
+  // mode) can subscribe to slider movement without postMessage round-trips.
+  (window as any).BroadcastSlider = BroadcastSlider;
 
   require('./broadcast_revisions').loadBroadcastRevisionsJS();
   changesetLoader = require('./broadcast')
@@ -165,10 +244,47 @@ const handleClientVars = (message) => {
   $('#playpause_button_icon').attr('title', html10n.get('timeslider.playPause'));
   $('#leftstep').attr('title', html10n.get('timeslider.backRevision'));
   $('#rightstep').attr('title', html10n.get('timeslider.forwardRevision'));
+  padutils.bindCheckboxChange($('#options-linenoscheck'), () => {
+    const showLineNumbers = padutils.getCheckbox('#options-linenoscheck');
+    setPadPref('showLineNumbers', showLineNumbers);
+    applyShowLineNumbers(showLineNumbers);
+  });
+  applyShowLineNumbers(readPadPrefs().showLineNumbers !== false);
 
-  // font family change
+  // Honour the view preferences the pad editor saved to the cookie so the
+  // first paint matches the user's pad settings.
+  applyShowAuthorColors(readPadPrefs().showAuthorshipColors !== false);
+  const padFontFamily = readPadPrefs().padFontFamily;
+  if (padFontFamily) $('#viewfontmenu').val(padFontFamily);
+  applyPadFontFamily(padFontFamily);
   $('#viewfontmenu').on('change', function () {
-    $('#innerdocbody').css('font-family', $(this).val() || '');
+    const fontFamily = $(this).val() || '';
+    setPadPref('padFontFamily', fontFamily);
+    applyPadFontFamily(fontFamily);
+  });
+
+  // Entry points for the outer pad shell (#7659 in-place history mode) to push
+  // view settings into this iframe live when the user changes them on the pad.
+  BroadcastSlider.setShowAuthorColors = (showAuthorColors) => {
+    applyShowAuthorColors(showAuthorColors);
+    setPadPref('showAuthorshipColors', showAuthorColors);
+  };
+  BroadcastSlider.setShowLineNumbers = (showLineNumbers) => {
+    applyShowLineNumbers(showLineNumbers);
+    setPadPref('showLineNumbers', showLineNumbers);
+  };
+  BroadcastSlider.setPadFontFamily = (fontFamily) => {
+    applyPadFontFamily(fontFamily);
+    setPadPref('padFontFamily', fontFamily);
+  };
+
+  const savedPlaybackSpeed = Cookies.get(`${cp}${playbackSpeedCookie}`) || '100';
+  $('#playbackspeed').val(savedPlaybackSpeed);
+  BroadcastSlider.setPlaybackSpeed(savedPlaybackSpeed);
+  $('#playbackspeed').on('change', function () {
+    const speed = String($(this).val() || '100');
+    Cookies.set(`${cp}${playbackSpeedCookie}`, speed);
+    BroadcastSlider.setPlaybackSpeed(speed);
   });
 };
 

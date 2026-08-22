@@ -91,7 +91,7 @@
  *    "password": "${PASSW:}" // if PASSW is not defined would result in password === ''
  *
  *    If you want to use an empty value (null) as default value for a variable,
- *    simply do not set it, without putting any colons: "${ABIWORD}".
+ *    simply do not set it, without putting any colons: "${SOFFICE}".
  *
  * 3) if you want to use newlines in the default value of a string parameter,
  *    use "\n" as usual.
@@ -105,12 +105,38 @@
   "title": "${TITLE:Etherpad}",
 
   /*
+  * Whether to show recent pads on the homepage or not.
+  */
+  "showRecentPads": "${SHOW_RECENT_PADS:true}",
+
+  /*
    * Pathname of the favicon you want to use. If null, the skin's favicon is
    * used if one is provided by the skin, otherwise the default Etherpad favicon
    * is used. If this is a relative path it is interpreted as relative to the
    * Etherpad root directory.
    */
   "favicon": "${FAVICON:null}",
+
+  /*
+   * Canonical public origin of this Etherpad instance, e.g.
+   * "https://pad.example.com" (no trailing slash, must include scheme).
+   * Used to build absolute URLs in OG/Twitter link-preview meta tags.
+   * When null, falls back to the incoming request's protocol+Host.
+   */
+  "publicURL": "${PUBLIC_URL:null}",
+
+  /*
+   * Open Graph / Twitter Card metadata for link previews.
+   *
+   * SOCIAL_META_DESCRIPTION: when set, this exact text is used as
+   * og:description regardless of negotiated language. Most preview crawlers
+   * (WhatsApp, Signal, Slack, ...) don't send Accept-Language, so without an
+   * override they always hit the English fallback in the i18n catalog.
+   * Leave unset (null) to use the catalog (key `pad.social.description`).
+   */
+  "socialMeta": {
+    "description": "${SOCIAL_META_DESCRIPTION:null}"
+  },
 
   /*
    * Skin name.
@@ -180,11 +206,65 @@
   "enableMetrics": "${ENABLE_METRICS:true}",
 
   /*
+   * Self-update subsystem.
+   * tier: "off" | "notify" | "manual" | "auto" | "autonomous"
+   * Default "notify" shows a banner when an update is available.
+   * Docker installs are read-only — tiers above "notify" are not applied even if requested.
+   * Air-gapped / offline deployments should set UPDATES_TIER=off to suppress the
+   * periodic check against the GitHub Releases API entirely.
+   */
+  "updates": {
+    "tier": "${UPDATES_TIER:notify}",
+    "source": "${UPDATES_SOURCE:github}",
+    "channel": "${UPDATES_CHANNEL:stable}",
+    "installMethod": "docker",
+    "checkIntervalHours": "${UPDATES_CHECK_INTERVAL_HOURS:6}",
+    "githubRepo": "${UPDATES_GITHUB_REPO:ether/etherpad}",
+    "requireAdminForStatus": "${UPDATES_REQUIRE_ADMIN_FOR_STATUS:false}",
+    "preApplyGraceMinutes": 0,
+    "drainSeconds": 60,
+    "rollbackHealthCheckSeconds": 60,
+    "diskSpaceMinMB": 500,
+    "requireSignature": false,
+    "trustedKeysPath": null,
+    "maintenanceWindow": null
+  },
+
+  /*
+   * Contact address for admin notifications (updates, security advisories, future features).
+   * Set to null to disable outbound mail from the updater.
+   */
+  "adminEmail": null,
+
+  /*
+   * SMTP transport. host=null keeps log-only behaviour; set host+from to send
+   * real mail via nodemailer (lazy-loaded). Pulls from env vars by default —
+   * leave the template as-is and provide MAIL_HOST / MAIL_FROM at runtime.
+   */
+  "mail": {
+    "host": "${MAIL_HOST:null}",
+    "port": "${MAIL_PORT:587}",
+    "secure": "${MAIL_SECURE:false}",
+    "from": "${MAIL_FROM:null}",
+    "auth": null
+  },
+
+  /*
    * Settings for cleanup of pads
    */
   "cleanup": {
     "enabled": false,
     "keepRevisions": 5
+  },
+
+  /*
+   * GDPR Art. 17 author erasure REST endpoint (anonymizeAuthor).
+   *
+   * Disabled by default — enable only when an operator process exists to
+   * authorise erasure requests.
+   */
+  "gdprAuthorErasure": {
+    "enabled": "${GDPR_AUTHOR_ERASURE_ENABLED:false}"
   },
 
   /*
@@ -199,6 +279,26 @@
   * Of course this overrides all the skin variants and the skinName set by the administrator.
   **/
   "enableDarkMode": "${ENABLE_DARK_MODE:true}",
+
+  /**
+  * Enable creator-owned Pad-wide Settings and new-pad default seeding from My View.
+  * The pad creator (revision-0 author) gets the "Pad-wide Settings" section,
+  * which lets them set defaults and optionally enforce them for other users.
+  * Other users see only "User Settings" (their own view options).
+  * Set to false to revert to the legacy single-settings behavior.
+  **/
+  "enablePadWideSettings": "${ENABLE_PAD_WIDE_SETTINGS:true}",
+
+  /*
+   * Optional privacy banner. See settings.json.template for full field docs.
+   */
+  "privacyBanner": {
+    "enabled": "${PRIVACY_BANNER_ENABLED:false}",
+    "title": "${PRIVACY_BANNER_TITLE:Privacy notice}",
+    "body": "${PRIVACY_BANNER_BODY:This instance processes pad content on our servers. See the linked policy for retention and how to request erasure.}",
+    "learnMoreUrl": "${PRIVACY_BANNER_LEARN_MORE_URL:null}",
+    "dismissal": "${PRIVACY_BANNER_DISMISSAL:dismissible}"
+  },
 
   /*
    * Node native SSL support
@@ -223,7 +323,19 @@
    *  https://etherpad.org/ep_infos
    */
 
-  "updateServer": "https://etherpad.org/ep_infos",
+  "updateServer": "${UPDATE_SERVER:https://etherpad.org/ep_infos}",
+
+  /*
+   * Outbound network calls. See PRIVACY.md for what each one sends.
+   *  - PRIVACY_UPDATE_CHECK=false   : disables the hourly version check (UpdateCheck.ts)
+   *  - PRIVACY_PLUGIN_CATALOG=false : disables the admin plugin browser
+   *                                   (manual install-by-name via CLI still works)
+   * Air-gapped / firewalled deployments should set both to false.
+   */
+  "privacy": {
+    "updateCheck": "${PRIVACY_UPDATE_CHECK:true}",
+    "pluginCatalog": "${PRIVACY_PLUGIN_CATALOG:true}"
+  },
 
   /*
    * The type of the database.
@@ -277,7 +389,9 @@
     "rtl":              "${PAD_OPTIONS_RTL:false}",
     "alwaysShowChat":   "${PAD_OPTIONS_ALWAYS_SHOW_CHAT:false}",
     "chatAndUsers":     "${PAD_OPTIONS_CHAT_AND_USERS:false}",
-    "lang":             "${PAD_OPTIONS_LANG:null}"
+    "lang":             "${PAD_OPTIONS_LANG:null}",
+    "fadeInactiveAuthorColors": "${PAD_OPTIONS_FADE_INACTIVE_AUTHOR_COLORS:true}",
+    "enforceReadableAuthorColors": "${PAD_OPTIONS_ENFORCE_READABLE_AUTHOR_COLORS:true}"
   },
 
   /*
@@ -344,24 +458,25 @@
   "maxAge": "${MAX_AGE:21600}", // 60 * 60 * 6 = 6 hours
 
   /*
-   * Absolute path to the Abiword executable.
+   * Absolute path to the soffice (LibreOffice) executable.
    *
-   * Abiword is needed to get advanced import/export features of pads. Setting
-   * it to null disables Abiword and will only allow plain text and HTML
-   * import/exports.
-   */
-  "abiword": "${ABIWORD:null}",
-
-  /*
-   * This is the absolute path to the soffice executable.
-   *
-   * LibreOffice can be used in lieu of Abiword to export pads.
-   * Setting it to null disables LibreOffice exporting.
+   * When configured, soffice handles all advanced office-format
+   * conversions (docx, pdf, odt, doc, rtf -- both directions). When
+   * null, Etherpad falls back to pure-JS in-process converters
+   * that handle docx export, pdf export, and docx import natively.
+   * odt/doc/rtf export and pdf import still require soffice.
    */
   "soffice": "${SOFFICE:null}",
 
   /*
-   * Allow import of file types other than the supported ones:
+   * When true (the default), the "Microsoft Word" export button
+   * downloads a .docx file -- via soffice if it's configured, or via
+   * the in-process html-to-docx converter otherwise. Set to false to
+   * revert to legacy .doc output (.doc still requires soffice).
+   */
+  "docxExport": "${DOCX_EXPORT:true}",
+
+  /*
    * txt, doc, docx, rtf, odt, html & htm
    */
   "allowUnknownFileEnds": "${ALLOW_UNKNOWN_FILE_ENDS:true}",
@@ -471,9 +586,24 @@
   },
 
   /*
-   * Privacy: disable IP logging
+   * Controls what Etherpad writes to its logs about client IP addresses.
+   * Allowed values: "anonymous" (default), "truncated", "full".
+   * See settings.json.template for details.
+   */
+  "ipLogging": "${IP_LOGGING:anonymous}",
+
+  /*
+   * Deprecated — use `ipLogging` above. Still honoured for one release
+   * cycle: true → "anonymous", false → "full".
    */
   "disableIPlogging": "${DISABLE_IP_LOGGING:false}",
+
+  /*
+   * Allow any user who can edit a pad to delete it without the one-time pad
+   * deletion token. If false, only the original creator's author cookie or the
+   * deletion token can delete the pad.
+   */
+  "allowPadDeletionByAllUsers": "${ALLOW_PAD_DELETION_BY_ALL_USERS:false}",
 
   /*
    * Time (in seconds) to automatically reconnect pad when a "Force reconnect"
@@ -569,13 +699,17 @@
 
   "socketIo": {
     /*
-     * Maximum permitted client message size (in bytes). All messages from
-     * clients that are larger than this will be rejected. Large values make it
-     * possible to paste large amounts of text, and plugins may require a larger
-     * value to work properly, but increasing the value increases susceptibility
-     * to denial of service attacks (malicious clients can exhaust memory).
+     * Maximum permitted client message size (in bytes). This controls the
+     * maximum single-message size for socket.io and directly affects large
+     * paste operations. All messages from clients that are larger than this
+     * will be rejected. Large values make it possible to paste large amounts
+     * of text, and plugins may require a larger value to work properly, but
+     * increasing the value increases susceptibility to denial of service
+     * attacks (malicious clients can exhaust memory).
+     *
+     * 1MB accommodates large pastes while still preventing abuse.
      */
-    "maxHttpBufferSize": "${SOCKETIO_MAX_HTTP_BUFFER_SIZE:50000}"
+    "maxHttpBufferSize": "${SOCKETIO_MAX_HTTP_BUFFER_SIZE:1000000}"
   },
 
   /*

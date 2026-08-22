@@ -9,6 +9,22 @@ const util = require('util');
 
 const logger = log4js.getLogger('SessionStore');
 
+// How often to run the cleanup of expired/stale sessions.
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+// Maximum number of session keys fetched from the database per cleanup
+// iteration. Bounded so that instances with very large session keyspaces (see
+// https://github.com/ether/etherpad/issues/7830) don't load every key into
+// memory at once. Tuned for ~50 KB per page assuming ~100-char keys.
+const CLEANUP_PAGE_SIZE = 500;
+
+// Upper bound on a single cleanup run. Under sustained session creation the
+// keyspace can grow faster than cleanup processes it; without a budget the
+// loop would never reach an empty page and the next scheduled run would never
+// fire. When the budget hits, the next scheduled run picks up where this one
+// left off (the database state advances each iteration regardless).
+const CLEANUP_MAX_RUNTIME_MS = 10 * 60 * 1000; // 10 minutes
+
 class SessionStore extends expressSession.Store {
   /**
    * @param {?number} [refresh] - How often (in milliseconds) `touch()` will update a session's
@@ -30,10 +46,113 @@ class SessionStore extends expressSession.Store {
     //     equal to `db`.
     //   - `timeout`: Timeout ID for a timeout that will clean up the database record.
     this._expirations = new Map();
+    this._cleanupTimer = null;
+    this._cleanupRunning = false;
+  }
+
+  /**
+   * Start periodic cleanup of expired/stale sessions from the database.
+   * Uses chained setTimeout (not setInterval) to prevent overlapping runs.
+   */
+  startCleanup() {
+    this._scheduleCleanup(5000); // First run 5s after startup.
+  }
+
+  _scheduleCleanup(delay: number) {
+    this._cleanupTimer = setTimeout(async () => {
+      try {
+        await this._cleanup();
+      } catch (err) {
+        logger.error('Session cleanup error:', err);
+      }
+      // Schedule the next run only after this one completes.
+      this._scheduleCleanup(CLEANUP_INTERVAL_MS);
+    }, delay);
+    // Don't prevent Node.js from exiting.
+    if (this._cleanupTimer.unref) this._cleanupTimer.unref();
   }
 
   shutdown() {
     for (const {timeout} of this._expirations.values()) clearTimeout(timeout);
+    if (this._cleanupTimer) {
+      clearTimeout(this._cleanupTimer);
+      this._cleanupTimer = null;
+    }
+  }
+
+  /**
+   * Remove expired and empty sessions from the database.
+   *
+   * - Sessions with an `expires` date in the past are removed (expired).
+   * - Sessions with no expiry that contain no data beyond the default cookie are removed.
+   *   These are the empty sessions that accumulate indefinitely (bug #5010) — they have
+   *   `{cookie: {path: "/", _expires: null, ...}}` and nothing else.
+   *
+   * Iterates the keyspace in fixed-size pages (CLEANUP_PAGE_SIZE) so a large
+   * sessionstorage table (#7830) doesn't load every key into memory at once.
+   */
+  async _cleanup() {
+    const now = Date.now();
+    const startMs = Date.now();
+    let removed = 0;
+    let scanned = 0;
+    let after: string | undefined;
+    let budgetExhausted = false;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const page = await DB.findKeysPaged('sessionstorage:*', null, {
+        limit: CLEANUP_PAGE_SIZE,
+        ...(after != null ? {after} : {}),
+      });
+      if (!page || page.length === 0) break;
+      // Defensive: a buggy backend that returns the cursor key would loop
+      // forever. `after` is exclusive, so the first key of the next page must
+      // be strictly greater than the previous cursor. Log so an operator can
+      // notice partial cleanup caused by a pagination regression.
+      if (after != null && page[0] <= after) {
+        logger.error(
+          `Session cleanup: paged cursor did not advance (after=${after}, ` +
+          `page[0]=${page[0]}); aborting this run to prevent an infinite loop`);
+        break;
+      }
+      for (const key of page) {
+        scanned++;
+        const sess = await DB.get(key);
+        if (!sess) {
+          await DB.remove(key);
+          removed++;
+          continue;
+        }
+        const expires = sess.cookie?.expires;
+        if (expires) {
+          if (new Date(expires).getTime() <= now) {
+            await DB.remove(key);
+            removed++;
+          }
+        } else {
+          const hasData = Object.keys(sess).some((k) => k !== 'cookie');
+          if (!hasData) {
+            await DB.remove(key);
+            removed++;
+          }
+        }
+      }
+      after = page[page.length - 1];
+      if (Date.now() - startMs > CLEANUP_MAX_RUNTIME_MS) {
+        budgetExhausted = true;
+        break;
+      }
+      // Yield to the event loop between pages so request handlers can run and
+      // the DB driver can release the previous page's buffered rows.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    if (budgetExhausted) {
+      logger.warn(
+        `Session cleanup: hit ${CLEANUP_MAX_RUNTIME_MS}ms budget after scanning ` +
+        `${scanned} keys (${removed} removed); next scheduled run will continue`);
+    } else if (removed > 0) {
+      logger.info(`Session cleanup: removed ${removed} expired/stale sessions out of ${scanned}`);
+    }
   }
 
   async _updateExpirations(sid: string, sess: any, updateDbExp = true) {
@@ -50,15 +169,22 @@ class SessionStore extends expressSession.Store {
       // If reading from the database, update the expiration with the latest value from touch() so
       // that touch() appears to write to the database every time even though it doesn't.
       if (typeof expires === 'string') sess.cookie.expires = new Date(exp.real).toJSON();
-      // Use this._get(), not this._destroy(), to destroy the DB record for the expired session.
-      // This is done in case multiple Etherpad instances are sharing the same database and users
-      // are bouncing between the instances. By using this._get(), this instance will query the DB
-      // for the latest expiration time written by any of the instances, ensuring that the record
-      // isn't prematurely deleted if the expiration time was updated by a different Etherpad
-      // instance. (Important caveat: Client-side database caching, which ueberdb does by default,
-      // could still cause the record to be prematurely deleted because this instance might get a
-      // stale expiration time from cache.)
-      exp.timeout = setTimeout(() => this._get(sid), exp.real - now);
+      // Schedule cleanup when the session is expected to expire. When the timeout fires, check
+      // the in-memory expiry first — touch() may have extended it without rescheduling the timeout
+      // (e.g., if touch's clearTimeout raced with the timer on a slow system). If the session was
+      // extended, reschedule instead of reading from the DB which may return stale cached data.
+      exp.timeout = setTimeout(() => {
+        const currentExp = this._expirations.get(sid);
+        if (currentExp && currentExp.real > Date.now()) {
+          // Expiry was extended (e.g., by touch). Reschedule.
+          currentExp.timeout = setTimeout(() => this._get(sid), currentExp.real - Date.now());
+          return;
+        }
+        // Use this._get(), not this._destroy(), to query the DB for the latest expiration in case
+        // multiple Etherpad instances share the database. (Caveat: client-side DB caching could
+        // still cause premature deletion if the cache returns a stale expiration time.)
+        this._get(sid);
+      }, exp.real - now);
       this._expirations.set(sid, exp);
     } else {
       this._expirations.delete(sid);

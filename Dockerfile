@@ -1,20 +1,48 @@
-# Etherpad Lite Dockerfile
+# Etherpad Dockerfile
 #
-# https://github.com/ether/etherpad-lite
+# https://github.com/ether/etherpad
 #
 # Author: muxator
+# Set to "copy" for builds without git metadata (source tarballs, some CI):
+#   docker build --build-arg BUILD_ENV=copy .
 ARG BUILD_ENV=git
 
-FROM node:lts-alpine AS adminbuild
-RUN npm install -g pnpm@latest
+# NOTE: this intentionally lags the "packageManager" pin in package.json. pnpm
+# 11.1.x enforces the minimum-release-age supply-chain policy during install,
+# which the frozen-lockfile Docker build can't satisfy, so the image stays on
+# 11.0.x. The version gap is made harmless by pnpm_config_pm_on_fail=ignore in
+# the build stage below — see ether/etherpad#7911.
+ARG PnpmVersion=11.0.6
+
+FROM node:24-alpine AS adminbuild
+# Install pnpm directly via npm (rather than via corepack) so the same
+# image recipe keeps working on Node 25+, where corepack has been
+# dropped from the distribution. The node:24-alpine image also bundles
+# yarn; remove it first to avoid leaving an unused binary on PATH.
+# Drop bundled npm afterwards — its older transitives (picomatch,
+# brace-expansion) carry CVEs we don't otherwise need.
+RUN rm -f /usr/local/bin/yarn /usr/local/bin/yarnpkg && \
+    npm install -g pnpm@${PnpmVersion} && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 WORKDIR /opt/etherpad-lite
 COPY . .
 RUN pnpm install
 RUN pnpm run build:ui
 
 
-FROM node:lts-alpine AS build
-LABEL maintainer="Etherpad team, https://github.com/ether/etherpad-lite"
+FROM node:24-alpine AS build
+LABEL maintainer="Etherpad team, https://github.com/ether/etherpad"
+
+# The image's pnpm intentionally lags the "packageManager" pin (see the ARG
+# note above). pnpm would otherwise try to self-provision the pinned version on
+# invocation — including the informational `pnpm --version` probe Etherpad runs
+# at startup — which fails closed with no network and breaks air-gapped boots
+# (ether/etherpad#7911). pm_on_fail=ignore makes pnpm use the installed version
+# instead. Inherited by the development and production runtime stages, so it
+# also covers the updater's pnpm-on-PATH check and ad-hoc `pnpm` in an exec
+# shell. It does not change which pnpm runs the build-time install (still the
+# installed 11.0.x), so the frozen-lockfile build is unaffected.
+ENV pnpm_config_pm_on_fail=ignore
 
 # Set these arguments when building the image from behind a proxy
 ARG http_proxy=
@@ -58,15 +86,7 @@ ARG ETHERPAD_LOCAL_PLUGINS=
 #   ETHERPAD_GITHUB_PLUGINS="ether/ep_plugin"
 ARG ETHERPAD_GITHUB_PLUGINS=
 
-# Control whether abiword will be installed, enabling exports to DOC/PDF/ODT formats.
-# By default, it is not installed.
-# If given any value, abiword will be installed.
-#
-# EXAMPLE:
-#   INSTALL_ABIWORD=true
-ARG INSTALL_ABIWORD=
-
-# Control whether libreoffice will be installed, enabling exports to DOC/PDF/ODT formats.
+# Control whether libreoffice will be installed, enabling exports to DOC/DOCX/PDF/ODT formats.
 # By default, it is not installed.
 # If given any value, libreoffice will be installed.
 #
@@ -96,17 +116,22 @@ RUN groupadd --system ${EP_GID:+--gid "${EP_GID}" --non-unique} etherpad && \
 ARG EP_DIR=/opt/etherpad-lite
 RUN mkdir -p "${EP_DIR}" && chown etherpad:etherpad "${EP_DIR}"
 
+# Install pnpm directly via npm (rather than via corepack) so the same
+# recipe stays valid on Node 25+, which dropped corepack. Then drop
+# both npm and the pre-bundled yarn binary to keep the runtime image
+# free of unused tooling and known-CVE transitives.
+#
 # the mkdir is needed for configuration of openjdk-11-jre-headless, see
 # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=863199
 RUN  \
     mkdir -p /usr/share/man/man1 && \
-    npm install pnpm@latest -g  && \
+    rm -f /usr/local/bin/yarn /usr/local/bin/yarnpkg && \
+    npm install -g pnpm@${PnpmVersion} && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx && \
     apk update && apk upgrade && \
     apk add --no-cache \
         ca-certificates \
-        curl \
         git \
-        ${INSTALL_ABIWORD:+abiword abiword-plugin-command} \
         ${INSTALL_SOFFICE:+libreoffice openjdk8-jre libreoffice-common} && \
     rm -rf /var/cache/apk/*
 
@@ -123,8 +148,13 @@ COPY --chown=etherpad:etherpad ./pnpm-workspace.yaml ./package.json ./
 
 
 FROM build AS build_git
-ONBUILD COPY --chown=etherpad:etherpad ./.git/HEA[D] ./.git/HEAD
-ONBUILD COPY --chown=etherpad:etherpad ./.git/ref[s] ./.git/refs
+# When checked out as a git submodule, .git is a file (gitlink) instead of a
+# directory, so .git/HEAD and .git/refs do not exist.  Copy the whole .git
+# entry (the .dockerignore already strips the heavy objects) and normalise it
+# with a shell step so the build succeeds in both cases and across builders
+# (Docker, buildah, podman).  See #6663 and containers/buildah#5742.
+ONBUILD COPY --chown=etherpad:etherpad ./.git ./.git
+ONBUILD RUN if [ -f .git ]; then rm .git; fi
 
 FROM build AS build_copy
 
@@ -139,8 +169,14 @@ ARG ETHERPAD_LOCAL_PLUGINS_ENV=
 ARG ETHERPAD_GITHUB_PLUGINS=
 
 COPY --chown=etherpad:etherpad ./src/ ./src/
-COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/ templates/admin./src/templates/admin
+COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/templates/admin ./src/templates/admin
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/static/oidc ./src/static/oidc
+# docker-compose mounts a named volume over src/plugin_packages. Docker seeds a
+# fresh named volume from the mountpoint in the image, so the directory has to
+# exist here (owned by etherpad, since USER is already etherpad) — otherwise
+# Docker creates it root:root and plugin installs cannot write install.lock.
+# See ether/etherpad#8026.
+RUN mkdir -p ./src/plugin_packages
 
 COPY --chown=etherpad:etherpad ./local_plugin[s] ./local_plugins/
 
@@ -162,9 +198,23 @@ ARG ETHERPAD_GITHUB_PLUGINS=
 ENV NODE_ENV=production
 ENV ETHERPAD_PRODUCTION=true
 
+# The full pnpm-workspace.yaml references admin, doc, ui which are not
+# needed at runtime. Overwrite it with a production-only version so
+# pnpm install doesn't warn about missing workspace directories.
+# Preserve the build-script policy from the source workspace file so
+# pnpm 11 doesn't error out with ERR_PNPM_IGNORED_BUILDS for transitive
+# postinstalls (e.g. @scarf/scarf via swagger-ui-dist).
+RUN printf 'packages:\n  - src\n  - bin\nonlyBuiltDependencies:\n  - esbuild\nignoredBuiltDependencies:\n  - "@scarf/scarf"\nstrictDepBuilds: false\n' > pnpm-workspace.yaml
+
 COPY --chown=etherpad:etherpad ./src ./src
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/templates/admin ./src/templates/admin
 COPY --chown=etherpad:etherpad --from=adminbuild /opt/etherpad-lite/src/static/oidc ./src/static/oidc
+# docker-compose mounts a named volume over src/plugin_packages. Docker seeds a
+# fresh named volume from the mountpoint in the image, so the directory has to
+# exist here (owned by etherpad, since USER is already etherpad) — otherwise
+# Docker creates it root:root and plugin installs cannot write install.lock.
+# See ether/etherpad#8026.
+RUN mkdir -p ./src/plugin_packages
 
 COPY --chown=etherpad:etherpad ./local_plugin[s] ./local_plugins/
 
@@ -186,7 +236,18 @@ COPY --chown=etherpad:etherpad ${SETTINGS} "${EP_DIR}"/settings.json
 USER etherpad
 
 HEALTHCHECK --interval=5s --timeout=3s \
-  CMD curl --silent http://localhost:9001/health | grep -E "pass|ok|up" > /dev/null || exit 1
+  CMD wget -qO- http://127.0.0.1:9001/health | grep -E "pass|ok|up" > /dev/null || exit 1
 
 EXPOSE 9001
-CMD ["pnpm", "run", "prod"]
+# Run node directly instead of via `pnpm run prod`. pnpm 11's
+# `runDepsStatusCheck` fires before every `pnpm run …` and spuriously
+# decides node_modules is out of sync on first start under the named-
+# volume layout used by docker-compose (mounting src/plugin_packages).
+# It then tries to `pnpm install --production`, which either prompts to
+# wipe node_modules (tty: true) or aborts with
+# ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY (no tty). Bypassing pnpm
+# at runtime sidesteps the check; the image's node_modules was already
+# verified during build. See ether/etherpad#7718.
+# `exec` makes node PID 1 so it receives SIGTERM directly and shuts down
+# cleanly.
+CMD ["sh", "-c", "cd src && exec node --require tsx/cjs node/server.ts"]

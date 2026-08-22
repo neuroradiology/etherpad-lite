@@ -207,6 +207,33 @@ The return value of this hook will add elements into the "lineMarkerAttribute"
 category, making the aceDomLineProcessLineAttributes hook (documented below)
 call for those elements.
 
+## aceRegisterLineAttributes
+
+Called from: `src/static/js/ace2_inner.ts`
+
+Things in context: None
+
+Tells Etherpad which line attributes should be preserved when a user presses
+Enter to split a line. Without this hook, custom line attributes (such as
+headings or alignment) are lost when a line is split.
+
+The return value should be an array of attribute names:
+
+```
+exports.aceRegisterLineAttributes = function(){
+  return [ 'heading' ];
+}
+```
+
+When Enter is pressed on a line that has a registered attribute:
+
+* **Middle or end of line:** the attribute is copied to the new line below.
+* **Start of line (column 0):** the attribute moves down with the text content,
+  and the now-empty line above is cleared.
+
+This is backwards compatible — on Etherpad versions that do not have this hook,
+the registration is silently ignored.
+
 ## aceInitialized
 
 Called from: `src/static/js/ace2_inner.js`
@@ -327,6 +354,34 @@ Context properties:
 
 * `message`: The message object that will be sent to the Etherpad server.
 
+## `chatPrefillFromUser`
+
+Called from: `src/static/js/pad_userlist.ts`
+
+Called when the user clicks an entry in the user list. The default behavior is to
+open the chat panel and prefill the input with `@<name> `, where `<name>` is that
+user's display name (with whitespace replaced by underscores). Plugins can return
+a different prefill string from their callback — the first non-empty string
+returned wins.
+
+Typical use is by AI/bot plugins whose author display name (e.g. "AI Assistant")
+isn't a useful @-mention; the plugin can substitute its trigger string instead.
+
+Context properties:
+
+* `authorId`: The clicked user's author id.
+* `name`: The clicked user's display name.
+* `prefill`: The default prefill string Etherpad would otherwise use.
+
+Example:
+
+```javascript
+exports.chatPrefillFromUser = (hookName, {authorId, name}, cb) => {
+  if (authorId === window.clientVars.ep_my_bot.authorId) return cb('@bot ');
+  return cb();
+};
+```
+
 ## collectContentPre
 
 Called from: `src/static/js/contentcollector.js`
@@ -410,6 +465,20 @@ also use this to handle existing types.
 `collab_client.js` has a pretty extensive list of message types, if you want to
 take a look.
 
+## handleClientTimesliderMessage_`name`
+
+Called from: `src/static/js/broadcast.ts`
+
+Things in context:
+
+1. payload - the data that got sent with the message (use it for custom message
+   content)
+
+This is the timeslider analog of `handleClientMessage_name`. It gets called
+every time the timeslider receives a message of type `name`. Use it to handle
+custom message types (or react to existing ones) while a user is viewing the
+timeslider rather than editing the pad.
+
 ## aceStartLineAndCharForPoint-aceEndLineAndCharForPoint
 
 Called from: src/static/js/ace2_inner.js
@@ -440,6 +509,34 @@ Things in context:
 
 This hook is provided to allow a plugin to handle key events.
 The return value should be true if you have handled the event.
+
+## acePaste
+
+Called from: `src/static/js/ace2_inner.ts`
+
+Things in context:
+
+1. editorInfo - information about the user who is making the change
+2. rep - information about where the change is being made
+3. documentAttributeManager - information about attributes in the document
+4. e - the fired paste event
+
+This hook is called when content is pasted into the editor, before Etherpad
+processes the pasted content. Use it to inspect or react to paste events.
+
+## aceDrop
+
+Called from: `src/static/js/ace2_inner.ts`
+
+Things in context:
+
+1. editorInfo - information about the user who is making the change
+2. rep - information about where the change is being made
+3. documentAttributeManager - information about attributes in the document
+4. e - the fired drop event
+
+This hook is called when content is dropped into the editor via drag-and-drop.
+Use it to inspect or react to drop events.
 
 ## collectContentLineText
 

@@ -26,7 +26,7 @@
 const makeCSSManager = require('./cssmanager').makeCSSManager;
 const domline = require('./domline').domline;
 import AttribPool from './AttributePool';
-import {compose, deserializeOps, inverse, moveOpsToNewPool, mutateAttributionLines, mutateTextLines, splitAttributionLines, splitTextLines, unpack} from './Changeset';
+import {compose, deserializeOps, inverse, isIdentity, moveOpsToNewPool, mutateAttributionLines, mutateTextLines, splitAttributionLines, splitTextLines, unpack} from './Changeset';
 const attributes = require('./attributes');
 const linestylefilter = require('./linestylefilter').linestylefilter;
 const colorutils = require('./colorutils').colorutils;
@@ -50,7 +50,10 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
     }
   };
 
-  const padContents = {
+  // Exposed on `window` so the outer pad shell (issue #7659 in-place
+  // history mode) can read `currentTime` after each scrub to drive chat
+  // replay and other revision-anchored UI without postMessage round-trips.
+  const padContents: any = (window as any).padContents = {
     currentRevision: clientVars.collab_client_vars.rev,
     currentTime: clientVars.collab_client_vars.time,
     currentLines:
@@ -132,6 +135,74 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
     },
   };
 
+  const targetBody = document.getElementById('innerdocbody');
+  const sideDiv = document.getElementById('sidediv');
+  const sideDivInner = document.getElementById('sidedivinner');
+  const appendNewSideDivLine = () => {
+    const lineDiv = document.createElement('div');
+    sideDivInner.appendChild(lineDiv);
+    const lineSpan = document.createElement('span');
+    lineSpan.classList.add('line-number');
+    lineSpan.appendChild(document.createTextNode(sideDivInner.children.length));
+    lineDiv.appendChild(lineSpan);
+  };
+
+  const updateLineNumbers = () => {
+    if (!targetBody || !sideDiv || !sideDivInner) return;
+    const lineOffsets = [];
+    const lineHeights = [];
+    const innerdocbodyStyles = getComputedStyle(targetBody);
+    const defaultLineHeight = parseInt(innerdocbodyStyles.lineHeight);
+
+    for (const docLine of targetBody.children) {
+      let height;
+      const nextDocLine = docLine.nextElementSibling;
+      if (nextDocLine) {
+        // Use the consistent (next - current) formula for every line,
+        // including the first. The previous first-line special case
+        // subtracted innerdocbody.padding-top from nextDocLine.offsetTop,
+        // which only works when innerdocbody is the offsetParent. In the
+        // in-pad history iframe (#7659) it isn't (its outerdocbody has
+        // padding-top of its own), so the first gutter row was 20px too
+        // tall and every subsequent row drifted out of alignment.
+        height = nextDocLine.offsetTop - docLine.offsetTop;
+      } else {
+        height = docLine.clientHeight || docLine.offsetHeight;
+      }
+      lineOffsets.push(height);
+
+      if (docLine.clientHeight !== defaultLineHeight && docLine.firstElementChild != null) {
+        const elementStyle = window.getComputedStyle(docLine.firstElementChild);
+        const lineHeight = parseInt(elementStyle.getPropertyValue('line-height'));
+        const marginBottom = parseInt(elementStyle.getPropertyValue('margin-bottom'));
+        lineHeights.push(lineHeight + marginBottom);
+      } else {
+        lineHeights.push(defaultLineHeight);
+      }
+    }
+
+    const newNumLines = Math.max(targetBody.children.length, 1);
+    while (sideDivInner.children.length < newNumLines) appendNewSideDivLine();
+    while (sideDivInner.children.length > newNumLines) sideDivInner.lastElementChild.remove();
+    for (const [i, sideDivLine] of Array.prototype.entries.call(sideDivInner.children)) {
+      sideDivLine.style.height = `${lineOffsets[i]}px`;
+      sideDivLine.style.lineHeight = `${lineHeights[i]}px`;
+    }
+    $(sideDiv).addClass('sidedivdelayed');
+  };
+
+  let lineNumberUpdatePending = false;
+  const scheduleLineNumberUpdate = () => {
+    if (lineNumberUpdatePending) return;
+    lineNumberUpdatePending = true;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        lineNumberUpdatePending = false;
+        updateLineNumbers();
+      });
+    });
+  };
+
   const applyChangeset = (changeset, revision, preventSliderMovement, timeDelta) => {
     // disable the next 'gotorevision' call handled by a timeslider update
     if (!preventSliderMovement) {
@@ -139,54 +210,62 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
       BroadcastSlider.setSliderPosition(revision);
     }
 
-    const oldAlines = padContents.alines.slice();
-    try {
-      // must mutate attribution lines before text lines
-      mutateAttributionLines(changeset, padContents.alines, padContents.apool);
-    } catch (e) {
-      debugLog(e);
-    }
-
-    // scroll to the area that is changed before the lines are mutated
-    if ($('#options-followContents').is(':checked') ||
-        $('#options-followContents').prop('checked')) {
-      // get the index of the first line that has mutated attributes
-      // the last line in `oldAlines` should always equal to "|1+1", ie newline without attributes
-      // so it should be safe to assume this line has changed attributes when inserting content at
-      // the bottom of a pad
-      let lineChanged;
-      _.some(oldAlines, (line, index) => {
-        if (line !== padContents.alines[index]) {
-          lineChanged = index;
-          return true; // break
-        }
-      });
-      // some chars are replaced (no attributes change and no length change)
-      // test if there are keep ops at the start of the cs
-      if (lineChanged === undefined) {
-        const [op] = deserializeOps(unpack(changeset).ops);
-        lineChanged = op != null && op.opcode === '=' ? op.lines : 0;
+    // Skip mutation for identity changesets (no actual change), but still advance
+    // revision/time state. Identity changesets can appear when compose() of multiple
+    // revisions produces a net-zero change, or from import/save sequences.
+    // See https://github.com/ether/etherpad-lite/issues/5214
+    if (!isIdentity(changeset)) {
+      const oldAlines = padContents.alines.slice();
+      try {
+        // must mutate attribution lines before text lines
+        mutateAttributionLines(changeset, padContents.alines, padContents.apool);
+      } catch (e) {
+        debugLog(e);
       }
 
-      const goToLineNumber = (lineNumber) => {
-        // Sets the Y scrolling of the browser to go to this line
-        const line = $('#innerdocbody').find(`div:nth-child(${lineNumber + 1})`);
-        const newY = $(line)[0].offsetTop;
-        const ecb = document.getElementById('editorcontainerbox');
-        // Chrome 55 - 59 bugfix
-        if (ecb.scrollTo) {
-          ecb.scrollTo({top: newY, behavior: 'auto'});
-        } else {
-          $('#editorcontainerbox').scrollTop(newY);
+      // scroll to the area that is changed before the lines are mutated
+      if ($('#options-followContents').is(':checked') ||
+          $('#options-followContents').prop('checked')) {
+        // get the index of the first line that has mutated attributes
+        // the last line in `oldAlines` should always equal to "|1+1", ie newline without attributes
+        // so it should be safe to assume this line has changed attributes when inserting content at
+        // the bottom of a pad
+        let lineChanged;
+        _.some(oldAlines, (line, index) => {
+          if (line !== padContents.alines[index]) {
+            lineChanged = index;
+            return true; // break
+          }
+        });
+        // some chars are replaced (no attributes change and no length change)
+        // test if there are keep ops at the start of the cs
+        if (lineChanged === undefined) {
+          const [op] = deserializeOps(unpack(changeset).ops);
+          lineChanged = op != null && op.opcode === '=' ? op.lines : 0;
         }
-      };
 
-      goToLineNumber(lineChanged);
+        const goToLineNumber = (lineNumber) => {
+          // Sets the Y scrolling of the browser to go to this line
+          const line = $('#innerdocbody').find(`div:nth-child(${lineNumber + 1})`);
+          const newY = $(line)[0].offsetTop;
+          const ecb = document.getElementById('editorcontainerbox');
+          // Chrome 55 - 59 bugfix
+          if (ecb.scrollTo) {
+            ecb.scrollTo({top: newY, behavior: 'auto'});
+          } else {
+            $('#editorcontainerbox').scrollTop(newY);
+          }
+        };
+
+        goToLineNumber(lineChanged);
+      }
+
+      mutateTextLines(changeset, padContents);
     }
 
-    mutateTextLines(changeset, padContents);
     padContents.currentRevision = revision;
     padContents.currentTime += timeDelta;
+    scheduleLineNumberUpdate();
 
     updateTimer();
 
@@ -201,7 +280,9 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
     revisionInfo.addChangeset(
         revision, revision + 1, changesetForward, changesetBackward, timeDelta);
     BroadcastSlider.setSliderLength(revisionInfo.latest);
-    if (broadcasting) applyChangeset(changesetForward, revision + 1, false, timeDelta);
+    if (broadcasting) {
+      applyChangeset(changesetForward, revision + 1, false, timeDelta);
+    }
   };
 
   /*
@@ -276,7 +357,9 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
         changeset = compose(changeset, cs[i], padContents.apool);
         timeDelta += path.times[i];
       }
-      if (changeset) applyChangeset(changeset, path.rev, true, timeDelta);
+      if (changeset) {
+        applyChangeset(changeset, path.rev, true, timeDelta);
+      }
     } else if (path.status === 'partial') {
       // callback is called after changeset information is pulled from server
       // this may never get called, if the changeset has already been loaded
@@ -294,7 +377,9 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
         changeset = compose(changeset, cs[i], padContents.apool);
         timeDelta += path.times[i];
       }
-      if (changeset) applyChangeset(changeset, path.rev, true, timeDelta);
+      if (changeset) {
+        applyChangeset(changeset, path.rev, true, timeDelta);
+      }
 
       // Loading changeset history for new revision
       loadChangesetsForRevision(newRevision, update);
@@ -452,6 +537,12 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
       padContents.currentDivs.push(div);
       $('#innerdocbody').append(div);
     }
+    updateLineNumbers();
+    scheduleLineNumberUpdate();
+    $(window).on('resize', scheduleLineNumberUpdate);
+    window.addEventListener('load', scheduleLineNumberUpdate, {once: true});
+    document.fonts?.ready?.then(scheduleLineNumberUpdate);
+    $('#viewfontmenu').on('change', () => window.setTimeout(scheduleLineNumberUpdate, 0));
   });
 
   // this is necessary to keep infinite loops of events firing,
@@ -474,7 +565,7 @@ const loadBroadcastJS = (socket, sendSocketMsg, fireWhenAllScriptsAreLoaded, Bro
       const bgcolor = typeof data.colorId === 'number'
         ? clientVars.colorPalette[data.colorId] : data.colorId;
       if (bgcolor) {
-        const selector = dynamicCSS.selectorStyle(`.${linestylefilter.getAuthorClassName(author)}`);
+        const selector = dynamicCSS.selectorStyle(`.authorColors .${linestylefilter.getAuthorClassName(author)}`);
         selector.backgroundColor = bgcolor;
         selector.color = (colorutils.luminosity(colorutils.css2triple(bgcolor)) < 0.5)
           ? '#ffffff' : '#000000'; // see ace2_inner.js for the other part

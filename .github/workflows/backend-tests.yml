@@ -12,8 +12,11 @@ on:
 permissions:
   contents: read
 
+
 jobs:
   withoutpluginsLinux:
+    env:
+      PNPM_HOME: ~/.pnpm-store
     # run on pushes to any branch
     # run on PRs from external forks
     if: |
@@ -24,42 +27,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        # Etherpad requires Node >= 24 (see package.json engines.node).
+        node: ${{ fromJSON('[24]') }}
     steps:
       -
         name: Checkout repository
-        uses: actions/checkout@v4
-      -
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          node-version: ${{ matrix.node }}
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-        with:
-            version: 10
-            run_install: false
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-            echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-      - uses: actions/cache@v4
-        name: Setup pnpm cache
-        with:
-          path: ${{ env.STORE_PATH }}
+          path: ${{ env.PNPM_HOME }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
-      - name: Only install direct dependencies
-        run: pnpm config set auto-install-peers false
+      - uses: pnpm/action-setup@v6.0.10
+        name: Install pnpm
+        with:
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
       -
         name: Install libreoffice
-        uses: awalsh128/cache-apt-pkgs-action@v1.5.1
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
           packages: libreoffice libreoffice-pdfimport
           version: 1.0
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: bin/installDeps.sh
+        run: pnpm i --frozen-lockfile
       - name: Install admin ui
         working-directory: admin
         run: pnpm install
@@ -74,6 +72,8 @@ jobs:
         run: pnpm run test:vitest
 
   withpluginsLinux:
+    env:
+      PNPM_HOME: ~/.pnpm-store
     # run on pushes to any branch
     # run on PRs from external forks
     if: |
@@ -84,60 +84,52 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22, 24]
+        node: ${{ fromJSON('[24]') }}
     steps:
       -
         name: Checkout repository
-        uses: actions/checkout@v4
-      -
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          node-version: ${{ matrix.node }}
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-        with:
-          version: 10
-          run_install: false
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-      - uses: actions/cache@v4
-        name: Setup pnpm cache
-        with:
-          path: ${{ env.STORE_PATH }}
+          path: ${{ env.PNPM_HOME }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
-      - name: Only install direct dependencies
-        run: pnpm config set auto-install-peers false
+      - uses: pnpm/action-setup@v6.0.10
+        name: Install pnpm
+        with:
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
       -
         name: Install libreoffice
-        uses: awalsh128/cache-apt-pkgs-action@v1.5.1
+        uses: awalsh128/cache-apt-pkgs-action@v1.6.3
         with:
           packages: libreoffice libreoffice-pdfimport
           version: 1.0
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: bin/installDeps.sh
-      - name: Install admin ui
-        working-directory: admin
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: Build admin ui
         working-directory: admin
         run: pnpm build
       -
         name: Install Etherpad plugins
         run: >
-          pnpm install --workspace-root
+          pnpm add -w
           ep_align
           ep_author_hover
           ep_cursortrace
+          ep_font_color
           ep_font_size
           ep_hash_auth
           ep_headings2
           ep_markdown
-          ep_readonly_guest
+          ep_guest
           ep_set_title_on_pad
           ep_spellcheck
           ep_subscript_and_superscript
@@ -149,46 +141,53 @@ jobs:
         working-directory: src
         run: pnpm run test:vitest
 
+  # Windows tests only run on push to develop/master, not on PRs
   withoutpluginsWindows:
-    # run on pushes to any branch
-    # run on PRs from external forks
+    env:
+      PNPM_HOME: ~\\.pnpm-store
     if: |
-      (github.event_name != 'pull_request')
-      || (github.event.pull_request.head.repo.id != github.event.pull_request.base.repo.id)
+      github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Etherpad requires Node >= 24 (see package.json engines.node).
+        # Windows pins Node 24.16.0, not the runner-default 24.15.0. Node 24.15.0's
+        # bundled libuv (1.51.0) has a stack buffer overrun in the Windows TCP-connect
+        # path (uv__tcp_connect), proven by a /GS __fastfail full-memory dump under the
+        # backend suite's heavy localhost connection churn -- the long-standing Windows
+        # backend silent-ELIFECYCLE flake (memory corruption, so no JS/Node
+        # observability). Bisect: 24.15.0 crashes (4/4 on 127.0.0.1), 24.16.0
+        # (libuv 1.52.1) is clean (0/8). Stays on the 24 LTS line. Pin explicitly
+        # because setup-node's default check-latest:false reuses the runner's
+        # pre-cached 24.15.0 for a bare "24".
+        # Tracking: https://github.com/nodejs/node/issues/63620 — drop this pin
+        # back to plain "24" once the fix is across the supported 24.x baseline.
+        node: ${{ fromJSON('["24.16.0"]') }}
     name: Windows without plugins
     runs-on: windows-latest
     steps:
       -
         name: Checkout repository
-        uses: actions/checkout@v4
-      -
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          node-version: 20
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-        with:
-          version: 10
-          run_install: false
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-      - uses: actions/cache@v4
-        name: Setup pnpm cache
-        with:
-          path: ${{ env.STORE_PATH }}
+          path: ${{ env.PNPM_HOME }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
-      - name: Only install direct dependencies
-        run: pnpm config set auto-install-peers false
+      - uses: pnpm/action-setup@v6.0.10
+        name: Install pnpm
+        with:
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: bin/installOnWindows.bat
-      - name: Install admin ui
-        working-directory: admin
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: Build admin ui
         working-directory: admin
         run: pnpm build
@@ -199,67 +198,77 @@ jobs:
           powershell -Command "(gc settings.json.holder) -replace '\"points\": 10', '\"points\": 1000' | Out-File -encoding ASCII settings.json"
       -
         name: Run the backend tests
+        shell: bash
         working-directory: src
-        run: pnpm test
+        # --exit makes mocha call process.exit() after the run so a leaked handle
+        # cannot hang the job on Windows.
+        run: pnpm test -- --exit
       - name: Run the new vitest tests
         working-directory: src
         run: pnpm run test:vitest
 
   withpluginsWindows:
-    # run on pushes to any branch
-    # run on PRs from external forks
+    env:
+      PNPM_HOME: ~\\.pnpm-store
     if: |
-      (github.event_name != 'pull_request')
-      || (github.event.pull_request.head.repo.id != github.event.pull_request.base.repo.id)
+      github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Etherpad requires Node >= 24 (see package.json engines.node).
+        # Windows pins Node 24.16.0, not the runner-default 24.15.0. Node 24.15.0's
+        # bundled libuv (1.51.0) has a stack buffer overrun in the Windows TCP-connect
+        # path (uv__tcp_connect), proven by a /GS __fastfail full-memory dump under the
+        # backend suite's heavy localhost connection churn -- the long-standing Windows
+        # backend silent-ELIFECYCLE flake (memory corruption, so no JS/Node
+        # observability). Bisect: 24.15.0 crashes (4/4 on 127.0.0.1), 24.16.0
+        # (libuv 1.52.1) is clean (0/8). Stays on the 24 LTS line. Pin explicitly
+        # because setup-node's default check-latest:false reuses the runner's
+        # pre-cached 24.15.0 for a bare "24".
+        # Tracking: https://github.com/nodejs/node/issues/63620 — drop this pin
+        # back to plain "24" once the fix is across the supported 24.x baseline.
+        node: ${{ fromJSON('["24.16.0"]') }}
     name: Windows with Plugins
     runs-on: windows-latest
 
     steps:
       -
         name: Checkout repository
-        uses: actions/checkout@v4
-      -
-        uses: actions/setup-node@v4
+        uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        name: Cache pnpm store
         with:
-          node-version: 22
-      - uses: pnpm/action-setup@v4
-        name: Install pnpm
-        with:
-          version: 10
-          run_install: false
-      - name: Get pnpm store directory
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-      - uses: actions/cache@v4
-        name: Setup pnpm cache
-        with:
-          path: ${{ env.STORE_PATH }}
+          path: ${{ env.PNPM_HOME }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: |
             ${{ runner.os }}-pnpm-store-
-      - name: Only install direct dependencies
-        run: pnpm config set auto-install-peers false
-      - name: Install admin ui
-        working-directory: admin
+      - uses: pnpm/action-setup@v6.0.10
+        name: Install pnpm
+        with:
+          run_install: false
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install dependencies
         run: pnpm install
       - name: Build admin ui
         working-directory: admin
         run: pnpm build
       -
         name: Install Etherpad plugins
-        # The --legacy-peer-deps flag is required to work around a bug in npm
-        # v7: https://github.com/npm/cli/issues/2199
         run: >
-          pnpm install --workspace-root
+          pnpm add -w
           ep_align
           ep_author_hover
           ep_cursortrace
+          ep_font_color
           ep_font_size
           ep_hash_auth
           ep_headings2
           ep_markdown
-          ep_readonly_guest
+          ep_guest
           ep_set_title_on_pad
           ep_spellcheck
           ep_subscript_and_superscript
@@ -275,7 +284,7 @@ jobs:
       # rules.
       -
         name: Install all dependencies and symlink for ep_etherpad-lite
-        run: bin/installOnWindows.bat
+        run: pnpm install --frozen-lockfile
       -
         name:  Fix up the settings.json
         run: |
@@ -283,8 +292,11 @@ jobs:
           powershell -Command "(gc settings.json.holder) -replace '\"points\": 10', '\"points\": 1000' | Out-File -encoding ASCII settings.json"
       -
         name: Run the backend tests
+        shell: bash
         working-directory: src
-        run: pnpm test
+        # --exit makes mocha call process.exit() after the run so a leaked handle
+        # cannot hang the job on Windows.
+        run: pnpm test -- --exit
       - name: Run the new vitest tests
         working-directory: src
         run: pnpm run test:vitest

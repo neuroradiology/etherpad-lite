@@ -2,6 +2,7 @@
 	"@metadata": {
 		"authors": [
 			"Cedric31",
+			"Nicolas Eynaud",
 			"Quentí"
 		]
 	},
@@ -78,7 +79,6 @@
 	"pad.importExport.exportword": "Microsoft Word",
 	"pad.importExport.exportpdf": "PDF",
 	"pad.importExport.exportopen": "ODF (Open Document Format)",
-	"pad.importExport.abiword.innerHTML": "Podètz pas importar que de formats tèxte brut o html. Per de foncionalitats d'importacion mai evoluadas, <a href=\"https://github.com/ether/etherpad-lite/wiki/How-to-enable-importing-and-exporting-different-file-formats-with-AbiWord\">installatz abiword</a>.",
 	"pad.modals.connected": "Connectat.",
 	"pad.modals.reconnecting": "Reconnexion cap a vòstre Pad...",
 	"pad.modals.forcereconnect": "Forçar la reconnexion.",
@@ -116,6 +116,7 @@
 	"pad.chat.writeMessage.placeholder": "Escrivètz lo vòstre messatge aicí",
 	"timeslider.pageTitle": "Istoric dinamic de {{appTitle}}",
 	"timeslider.toolbar.returnbutton": "Retorn a aqueste Pad.",
+	"pad.historyMode.settings.followShort": "Seguir",
 	"timeslider.toolbar.authors": "Autors :",
 	"timeslider.toolbar.authorsList": "Pas cap d'autor",
 	"timeslider.toolbar.exportlink.title": "Exportar",

@@ -123,6 +123,25 @@
         }
         $dropdown.find('.list').css('max-height', $maxListHeight + 'px');
 
+        // Popups are scroll containers (since #7696) which would clip the
+        // absolutely-positioned dropdown list. The list is repositioned with
+        // `position: fixed` (see form.css) so it floats above the popup; we
+        // need viewport-relative coordinates here. Done after the reverse
+        // class is decided so we know which side of the dropdown to anchor.
+        if ($dropdown.closest('.toolbar').length === 0
+            && $dropdown.closest('.popup-content').length > 0) {
+          var rect = $dropdown[0].getBoundingClientRect();
+          var $list = $dropdown.find('.list');
+          $list.css('left', rect.left);
+          $list.css('min-width', $dropdown.outerWidth() + 'px');
+          // Clear .reverse's `bottom: calc(100% + 5px)` — with position:fixed
+          // it would resolve against the viewport and push the list offscreen.
+          $list.css('bottom', 'auto');
+          $list.css('top', $dropdown.hasClass('reverse')
+              ? rect.top - $maxListHeight - 5
+              : rect.bottom);
+        }
+
       } else {
         $dropdown.trigger('focus');
       }
@@ -146,7 +165,11 @@
       var text = $option.data('display') || $option.text();
       $dropdown.find('.current').text(text);
 
-      $dropdown.prev('select').val($option.data('value')).trigger('change');
+      const $nativeSelect = $dropdown.prev('select');
+      $nativeSelect.val($option.data('value')).trigger('change');
+      // Fire native event for handlers attached via addEventListener (e.g.
+      // the pad_mode.ts settings bridge to the embedded timeslider iframe).
+      $nativeSelect[0]?.dispatchEvent(new Event('change', {bubbles: true}));
     });
 
     // Keyboard events

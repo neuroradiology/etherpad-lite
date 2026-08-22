@@ -7,8 +7,9 @@ execute its own functionality based on these events.
 Publicly available plugins can be found in the npm registry (see
 <https://npmjs.org>). Etherpad's naming convention for plugins is to prefix your
 plugins with `ep_`. So, e.g. it's `ep_flubberworms`. Thus you can install
-plugins from npm, using `npm install --no-save --legacy-peer-deps
-ep_flubberworm` in Etherpad's root directory.
+plugins from npm, using `pnpm run plugins install ep_flubberworms` in Etherpad's root directory.
+
+Also see [wiki article](https://github.com/ether/etherpad-lite/wiki/Available-Plugins) for more info.
 
 You can also browse to `http://yourEtherpadInstan.ce/admin/plugins`, which will
 list all installed plugins and those available on npm. It even provides
@@ -37,7 +38,7 @@ ep_<plugin>/
  ├ locales/
  │  ├ en.json            ◄─ English (US) strings
  │  └ qqq.json           ◄─ optional hints for translators
- ├ .travis.yml           ◄─ Travis CI config
+ ├ .github/workflows/   ◄─ CI workflows (backend / frontend tests, npm publish)
  ├ LICENSE
  ├ README.md
  ├ ep.json               ◄─ Etherpad plugin definition
@@ -225,7 +226,7 @@ publish your plugin.
   "author": "USERNAME (REAL NAME) <MAIL@EXAMPLE.COM>",
   "contributors": [],
   "dependencies": {"MODULE": "0.3.20"},
-  "engines": {"node": ">=12.17.0"}
+  "engines": {"node": ">=22.0.0"}
 }
 ```
 
@@ -236,6 +237,78 @@ changing their functions), you should put the necessary HTML code for such
 operations in `templates/`, in files of type ".ejs", since Etherpad uses EJS for
 HTML templating. See the following link for more information about EJS:
 <https://github.com/visionmedia/ejs>.
+
+## Plugin-namespaced pad-wide options
+
+Plugins can ride the existing `padoptions` COLLABROOM rail to store
+pad-wide settings — broadcast to every connected client, persisted with the
+pad, and honored by `enforceSettings` — instead of inventing their own
+message type and storage. The model matches how `enablePadWideSettings`
+works for native toggles like sticky chat or line numbers.
+
+### Capability detection
+
+```js
+let padOptionsPluginPassthrough = false;
+try {
+  // The require throws on Etherpad versions that predate this capability;
+  // plugins should degrade gracefully (typically falling back to a per-user
+  // cookie toggle) when the flag is missing.
+  padOptionsPluginPassthrough =
+      require('ep_etherpad-lite/node/utils/PluginCapabilities')
+          .padOptionsPluginPassthrough === true;
+} catch (_e) { /* older core */ }
+```
+
+The flag means the core has the passthrough patch *available*. Whether it
+is actually *enabled* at runtime is a separate per-instance setting — see
+below.
+
+### Runtime flag
+
+The passthrough is gated by `settings.enablePluginPadOptions`, default
+`true`. Operators who want to lock plugins out of pad-wide state can flip
+it in `settings.json`:
+
+```json
+{
+  "enablePluginPadOptions": false
+}
+```
+
+When enabled (the default), the server reflects the value to every client via
+`clientVars.enablePluginPadOptions` so plugins can detect both *capable*
+(static) and *active* (per-pad request) at the same point.
+
+### Key namespace
+
+Plugins must use keys matching `/^ep_[a-z0-9_]+$/`. The recommended pattern
+is `ep_<plugin_name>` (e.g. `ep_table_of_contents`); compose multiple
+pad-wide settings under one key as a plain object:
+
+```js
+pad.changePadOption('ep_my_plugin', {enabled: true, depth: 3});
+```
+
+The server passes through any matching key on the existing `padoptions`
+message, persists it with the pad, and broadcasts it to every connected
+client. `pad.padOptions.ep_my_plugin` reflects the latest value on every
+client.
+
+### Validation
+
+Server-side `Pad.normalizePadSettings()` enforces three rules on every
+plugin-namespaced key:
+
+- Values must round-trip through `JSON.stringify` (no functions, symbols,
+  BigInt, or circular references).
+- Each key's serialized payload must fit within **64 KB**.
+- The combined size of all `ep_*` values per pad must fit within **256 KB**.
+
+Values that fail any of these rules are dropped with a `console.warn`; the
+rest of the settings round-trip cleanly. The caps prevent a misbehaving
+plugin from bloating the persisted pad payload or the COLLABROOM
+broadcast.
 
 ## Writing and running front-end tests for your plugin
 

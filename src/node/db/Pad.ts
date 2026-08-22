@@ -1,5 +1,5 @@
 'use strict';
-import {Database} from "ueberdb2";
+import type {Database} from "ueberdb2";
 import {AChangeSet, APool, AText} from "../types/PadType";
 import {MapArrayType} from "../types/MapType";
 
@@ -16,16 +16,97 @@ const assert = require('assert').strict;
 const db = require('./DB');
 import settings from '../utils/Settings';
 const authorManager = require('./AuthorManager');
+const padDeletionManager = require('./PadDeletionManager');
 const padManager = require('./PadManager');
 const padMessageHandler = require('../handler/PadMessageHandler');
 const groupManager = require('./GroupManager');
 const CustomError = require('../utils/customError');
 import readOnlyManager from './ReadOnlyManager';
 import randomString from '../utils/randomstring';
+import {SYSTEM_AUTHOR_ID} from '../utils/SystemAuthor';
 const hooks = require('../../static/js/pluginfw/hooks');
 import pad_utils from "../../static/js/pad_utils";
 import {SmartOpAssembler} from "../../static/js/SmartOpAssembler";
+import Op from "../../static/js/Op";
 import {timesLimit} from "async";
+import log4js from 'log4js';
+
+const logger = log4js.getLogger('pad');
+
+type PadViewSettings = {
+  showAuthorColors: boolean;
+  showLineNumbers: boolean;
+  rtlIsTrue: boolean;
+  padFontFamily: string;
+  fadeInactiveAuthorColors: boolean;
+};
+
+type PadSettings = {
+  enforceSettings: boolean;
+  showChat: boolean;
+  alwaysShowChat: boolean;
+  chatAndUsers: boolean;
+  lang: string | null;
+  view: PadViewSettings;
+  // Plugin-namespaced pad-wide options ride alongside the core keys.
+  // Anything matching /^ep_[a-z0-9_]+$/ is preserved verbatim by
+  // normalizePadSettings so plugins can use the existing padoptions
+  // broadcast/persist rail without forking their own transport.
+  [pluginKey: string]: any;
+};
+
+// Prefixes an error's message with context, keeping `err.stack` in sync.
+//
+// `err.stack` is rendered from the message when the error is constructed, so
+// assigning to `err.message` alone leaves the stack showing the original,
+// context-free text. Everything that reports a failed `pad.check()` logs
+// `err.stack` (Cleanup.checkTodos and the admin `cleanupPadRevisions`
+// handler both do), so without this the pad/revision that actually failed
+// never reaches the log and admins have to bisect the database by hand.
+// See #8134.
+const addErrorContext = (err: Error, context: string): Error => {
+  const oldMessage = err.message;
+  err.message = `${context} ${oldMessage}`;
+  // Only the first occurrence is replaced, which is the message in the
+  // stack's header line. Guard against an empty message: `''` matches at
+  // offset 0 and would corrupt the stack.
+  if (oldMessage && typeof err.stack === 'string' && err.stack.includes(oldMessage)) {
+    err.stack = err.stack.replace(oldMessage, err.message);
+  }
+  return err;
+};
+
+const PLUGIN_KEY_RE = /^ep_[a-z0-9_]+$/;
+// Per-key serialized JSON size cap: ~64 KB. Pad-wide settings are persisted
+// with the pad and broadcast to every connected client on every change, so
+// plugins must keep their values small. A misbehaving plugin shouldn't bloat
+// the pad payload or the broadcast.
+const PLUGIN_KEY_MAX_BYTES = 64 * 1024;
+// Combined ep_* size cap: ~256 KB. Same rationale, aggregated.
+const PLUGIN_TOTAL_MAX_BYTES = 256 * 1024;
+
+// Returns true iff `v` round-trips through JSON.stringify cleanly (no
+// functions, symbols, BigInt, or circular references) and serializes to at
+// most `maxBytes` UTF-8 bytes. Returns the serialized length on success so
+// callers can enforce a cumulative cap without serializing twice.
+const validatePluginValue = (
+    key: string, value: unknown, maxBytes: number): {ok: true, bytes: number} | {ok: false, reason: string} => {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (e: any) {
+    return {ok: false, reason: `JSON.stringify failed: ${e && e.message || e}`};
+  }
+  if (serialized === undefined) {
+    // JSON.stringify returns undefined for top-level functions/undefined.
+    return {ok: false, reason: 'value is not JSON-serializable (function/undefined)'};
+  }
+  const bytes = Buffer.byteLength(serialized, 'utf8');
+  if (bytes > maxBytes) {
+    return {ok: false, reason: `serialized size ${bytes}B exceeds per-key cap ${maxBytes}B`};
+  }
+  return {ok: true, bytes};
+};
 
 /**
  * Copied from the Etherpad source code. It converts Windows line breaks to Unix
@@ -35,10 +116,76 @@ import {timesLimit} from "async";
  */
 exports.cleanText = (txt:string): string => txt.replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
-    .replace(/\t/g, '        ')
-    .replace(/\xa0/g, ' ');
+    .replace(/\t/g, '        ');
 
 class Pad {
+  /**
+   * Stable author id used to attribute inserts coming from internal callers
+   * (HTTP API setText/appendText with no authorId, plugins like ep_post_data,
+   * server-side import flows). Without ANY author attribute, pad.atext.text
+   * and pad.atext.attribs drift out of sync — clients then fail
+   * setDocAText reconciliation in ace2_inner.ts when loading the pad. Using
+   * a fixed system author keeps the AText well-formed without requiring
+   * every plugin to allocate its own author up-front.
+   *
+   * Kept as a static for plugin compatibility; the canonical definition (and
+   * the one modules with a circular dependency on Pad must use) lives in
+   * ../utils/SystemAuthor.
+   */
+  static readonly SYSTEM_AUTHOR_ID = SYSTEM_AUTHOR_ID;
+
+  /**
+   * Validate that every `+` (insert) op in `aChangeset` carries an
+   * `author` attribute that resolves through `pool`. Callers that have
+   * already rebased onto pad.pool pass the post-rebase changeset, so
+   * we accept the pad's own pool here.
+   *
+   * Throws an Error if any insert op is missing an author attribute,
+   * carries an empty author, or references an attribute number that
+   * is not present in the pool.
+   *
+   * Tolerates `=` and `-` ops with empty attribs (those are the
+   * canonical form for keeps/deletes that don't change attribution).
+   * Also tolerates pure-newline `+` ops: the client's line assembler
+   * handles those regardless of attribs, and the API restoreRevision
+   * path emits them at line boundaries.
+   */
+  private static _assertInsertOpsCarryAuthor(aChangeset: string, pool: AttributePool) {
+    let unpacked;
+    try {
+      unpacked = unpack(aChangeset);
+    } catch (e: any) {
+      // unpack already throws a descriptive error; rethrow as-is so the
+      // caller's failure mode stays the same.
+      throw e;
+    }
+    for (const op of deserializeOps(unpacked.ops)) {
+      if (op.opcode !== '+') continue;
+      // Pure-newline inserts (e.g. `|1+1` for a single line break) are
+      // tolerated — the client's line assembler handles them regardless
+      // of attribs, and the API restoreRevision path emits them at
+      // line boundaries.
+      if (op.lines > 0 && op.chars === op.lines) continue;
+      if (!op.attribs) {
+        throw new Error(
+            'insert op without an author attribute ' +
+            `(empty attribs): ${aChangeset}`);
+      }
+      let authorIdSeen: string | undefined;
+      try {
+        authorIdSeen = AttributeMap.fromString(op.attribs, pool).get('author');
+      } catch (e: any) {
+        throw new Error(
+            'insert op references an attribute number ' +
+            `not present in the pool: ${aChangeset} (${e && e.message || e})`);
+      }
+      if (!authorIdSeen) {
+        throw new Error(
+            'insert op without an author attribute: ' + aChangeset);
+      }
+    }
+  }
+
   private db: Database;
   private atext: AText;
   private pool: AttributePool;
@@ -47,6 +194,7 @@ class Pad {
     private publicStatus: boolean;
     private id: string;
     private savedRevisions: any[];
+    private padSettings: PadSettings;
   /**
    * @param id
    * @param [database] - Database object to access this pad's records (and only this pad's records;
@@ -64,6 +212,55 @@ class Pad {
     this.publicStatus = false;
     this.id = id;
     this.savedRevisions = [];
+    this.padSettings = Pad.normalizePadSettings();
+  }
+
+  static normalizePadSettings(rawPadSettings: any = {}): PadSettings {
+    const rawView = rawPadSettings.view ?? {};
+    const result: PadSettings = {
+      enforceSettings: !!rawPadSettings.enforceSettings,
+      showChat: rawPadSettings.showChat == null ? settings.padOptions.showChat !== false :
+        !!rawPadSettings.showChat,
+      alwaysShowChat: !!rawPadSettings.alwaysShowChat,
+      chatAndUsers: !!rawPadSettings.chatAndUsers,
+      // Default to null (not 'en') so the client's l10n auto-detect chain
+      // (cookie -> navigator.language -> 'en' fallback) runs. Hardcoding 'en'
+      // forces English on every pad regardless of the browser's Accept-Language
+      // and broke #7586 (German system saw English pad UI in v2.7.0).
+      lang: typeof rawPadSettings.lang === 'string' ? rawPadSettings.lang : null,
+      view: {
+        showAuthorColors: rawView.showAuthorColors == null ? true : !!rawView.showAuthorColors,
+        showLineNumbers: rawView.showLineNumbers == null ?
+          settings.padOptions.showLineNumbers !== false : !!rawView.showLineNumbers,
+        rtlIsTrue: !!rawView.rtlIsTrue,
+        padFontFamily: typeof rawView.padFontFamily === 'string' ? rawView.padFontFamily : '',
+        fadeInactiveAuthorColors: rawView.fadeInactiveAuthorColors == null ?
+          settings.padOptions.fadeInactiveAuthorColors !== false :
+          !!rawView.fadeInactiveAuthorColors,
+      },
+    };
+    if (settings.enablePluginPadOptions) {
+      let totalBytes = 0;
+      for (const [k, v] of Object.entries(rawPadSettings)) {
+        if (!PLUGIN_KEY_RE.test(k)) continue;
+        const check = validatePluginValue(k, v, PLUGIN_KEY_MAX_BYTES);
+        if (!check.ok) {
+          // Drop and log. Persistence/broadcast still rejects the value, but
+          // the rest of the settings round-trip cleanly.
+          console.warn(`[normalizePadSettings] dropping ${k}: ${check.reason}`);
+          continue;
+        }
+        if (totalBytes + check.bytes > PLUGIN_TOTAL_MAX_BYTES) {
+          console.warn(
+              `[normalizePadSettings] dropping ${k}: combined ep_* size ` +
+              `would exceed cap ${PLUGIN_TOTAL_MAX_BYTES}B`);
+          continue;
+        }
+        totalBytes += check.bytes;
+        result[k] = v;
+      }
+    }
+    return result;
   }
 
   apool() {
@@ -88,6 +285,22 @@ class Pad {
     return this.publicStatus;
   }
 
+  getPadSettings() {
+    return Pad.normalizePadSettings(this.padSettings);
+  }
+
+  setPadSettings(rawPadSettings: any) {
+    const nextPadSettings = {
+      ...this.getPadSettings(),
+      ...rawPadSettings,
+      view: {
+        ...this.getPadSettings().view,
+        ...(rawPadSettings?.view ?? {}),
+      },
+    };
+    this.padSettings = Pad.normalizePadSettings(nextPadSettings);
+  }
+
   /**
    * Appends a new revision
    * @param {Object} aChangeset The changeset to append to the pad
@@ -95,11 +308,21 @@ class Pad {
    * @return {Promise<number|string>}
    */
   async appendRevision(aChangeset:string, authorId = '') {
+    // Centralised "every insert op carries an author attribute"
+    // invariant. The socket handler enforces the same rule at the wire
+    // boundary; checking here covers the non-wire callers (HTTP API
+    // setHTML/setText/restoreRevision, plugin paths that call
+    // appendRevision directly).
+    Pad._assertInsertOpsCarryAuthor(aChangeset, this.pool);
+
     const newAText = applyToAText(aChangeset, this.atext, this.pool);
     if (newAText.text === this.atext.text && newAText.attribs === this.atext.attribs &&
         this.head !== -1) {
       return this.head;
     }
+    // Snapshot for the rollback below, taken before this.atext is mutated.
+    const prevHead = this.head;
+    const prevAText: AText = {text: this.atext.text, attribs: this.atext.attribs};
     copyAText(newAText, this.atext);
 
     const newRev = ++this.head;
@@ -108,7 +331,19 @@ class Pad {
     if (authorId !== '') this.pool.putAttrib(['author', authorId]);
 
     const hook = this.head === 0 ? 'padCreate' : 'padUpdate';
-    await Promise.all([
+
+    // The revision record and the pad record (which carries `head`) are two
+    // independent writes. If the revision write fails while the pad record
+    // lands, the pad claims a revision that was never stored -- and because
+    // the next successful append writes head+1 straight over it, the gap is
+    // permanent. Any later pad.check() then trips on the missing revision,
+    // which blocks cleanup/compaction forever. See #8134.
+    //
+    // They stay concurrent (sequencing them would add a write round-trip to
+    // every commit on the editing hot path); instead a failure rolls the
+    // in-memory state back and re-persists the pad record, so the pad never
+    // ends up pointing past its own history.
+    const storageWrites = Promise.all([
       // @ts-ignore
       this.db.set(`pad:${this.id}:revs:${newRev}`, {
         changeset: aChangeset,
@@ -122,9 +357,16 @@ class Pad {
         },
       }),
       this.saveToDatabase(),
+    ]);
+
+    // Kept separate from the storage writes: a throwing padUpdate hook (or a
+    // failed author-index update) must not roll back a revision that was
+    // stored successfully. Started here so it still runs concurrently.
+    const sideEffects = Promise.all([
       authorId && authorManager.addPad(authorId, this.id),
       hooks.aCallAll(hook, {
         pad: this,
+        padId: this.id,
         authorId,
         get author() {
           pad_utils.warnDeprecated(`${hook} hook author context is deprecated; use authorId instead`);
@@ -140,7 +382,47 @@ class Pad {
         },
       }),
     ]);
+    // Awaited below. Attach a no-op handler so a rejection while we're
+    // awaiting the storage writes isn't reported as unhandled.
+    sideEffects.catch(() => {});
+
+    try {
+      await storageWrites;
+    } catch (err) {
+      await this._rollbackFailedRevision(newRev, prevHead, prevAText);
+      throw err;
+    }
+
+    await sideEffects;
     return newRev;
+  }
+
+  /**
+   * Undoes the in-memory effects of a failed appendRevision and re-persists
+   * the pad record, so `head` never points at a revision that isn't stored.
+   *
+   * The attribute pool is deliberately not rolled back: pool entries are
+   * addressed by position, so removing one would invalidate the attribute
+   * numbers in every changeset already written. A pool author with no
+   * revisions is harmless -- pad.check() derives both sides of its author
+   * comparison from the pool, so they still agree.
+   */
+  private async _rollbackFailedRevision(newRev: number, prevHead: number, prevAText: AText) {
+    this.head = prevHead;
+    copyAText(prevAText, this.atext);
+    try {
+      await this.saveToDatabase();
+    } catch (rollbackErr: any) {
+      // Both writes failed. The pad record may still claim `newRev`, which
+      // is the pre-#8134 behaviour; say so loudly rather than silently
+      // leaving a hole for an admin to find months later via a failed
+      // cleanup run.
+      logger.error(
+          `pad ${this.id}: revision ${newRev} failed to store AND the ` +
+          `rollback of head to ${prevHead} failed. The pad record may claim ` +
+          `a revision that does not exist; run a consistency check on it. ` +
+          `Rollback error: ${rollbackErr.stack || rollbackErr}`);
+    }
   }
 
   toJSON() {
@@ -172,7 +454,7 @@ class Pad {
 
   async getRevisionAuthor(revNum: number) {
     // @ts-ignore
-    return await this.db.getSub(`pad:${this.id}:revs:${revNum}`, ['meta', 'author']);
+    return await this.db.getSub(`pad:${this.id}:revs:${revNum}`, ['meta', 'author']) ?? '';
   }
 
   async getRevisionDate(revNum: number) {
@@ -215,8 +497,8 @@ class Pad {
           Stream.range(keyRev + 1, targetRev + 1).map(this.getRevisionChangeset.bind(this))),
     ]);
     const apool = this.apool();
-    let atext = keyAText;
-    for (const cs of changesets) atext = applyToAText(cs, atext, apool);
+    let atext = keyAText as AText;
+    for (const cs of changesets) atext = applyToAText(cs as string, atext, apool);
     return atext;
   }
 
@@ -294,8 +576,19 @@ class Pad {
         (!ins && start > 0 && orig[start - 1] === '\n');
     if (!willEndWithNewline) ins += '\n';
     if (ndel === 0 && ins.length === 0) return;
-    const changeset = makeSplice(orig, start, ndel, ins);
-    await this.appendRevision(changeset, authorId);
+    // An unattributed insert (empty authorId + non-empty ins) would produce
+    // an AText where `text` and `attribs` disagree on length — clients fail
+    // setDocAText reconciliation on load. Backward-compat fix: if the caller
+    // didn't provide an authorId, attribute the insert to a stable system
+    // author. ep_post_data and other plugins that want named attribution
+    // should still pass an explicit authorId.
+    const effectiveAuthorId =
+        (ins.length > 0 && !authorId) ? Pad.SYSTEM_AUTHOR_ID : authorId;
+    const attribs = effectiveAuthorId
+        ? [['author', effectiveAuthorId] as [string, string]]
+        : undefined;
+    const changeset = makeSplice(orig, start, ndel, ins, attribs, this.pool);
+    await this.appendRevision(changeset, effectiveAuthorId);
   }
 
   /**
@@ -351,7 +644,7 @@ class Pad {
   async getChatMessage(entryNum: number) {
     const entry = await this.db.get(`pad:${this.id}:chat:${entryNum}`);
     if (entry == null) return null;
-    const message = ChatMessage.fromObject(entry);
+    const message = ChatMessage.fromObject(entry as ChatMessage);
     message.displayName = await authorManager.getAuthorName(message.authorId);
     return message;
   }
@@ -381,26 +674,64 @@ class Pad {
 
   async init(text:string, authorId = '') {
     // try to load the pad
-    const value = await this.db.get(`pad:${this.id}`);
+    const value = await this.db.get(`pad:${this.id}`) as Record<string, any> | null;
 
     // if this pad exists, load it
     if (value != null) {
       Object.assign(this, value);
       if ('pool' in value) this.pool = new AttributePool().fromJsonable(value.pool);
     } else {
-      if (text == null) {
+      // Auto-generated default content (settings.defaultPadText or whatever a
+      // padDefaultContent hook substitutes) is not written by the user who
+      // happens to open the pad first, so the text must not carry their author
+      // attribute — otherwise the welcome text shows up in the creator's
+      // authorship colour (issue #7885). Track whether the text came from the
+      // default-content path so its insert op can be attributed to the system
+      // author.
+      const usedDefaultContent = (text == null);
+      if (usedDefaultContent) {
         const context = {pad: this, authorId, type: 'text', content: settings.defaultPadText};
         await hooks.aCallAll('padDefaultContent', context);
         if (context.type !== 'text') throw new Error(`unsupported content type: ${context.type}`);
         text = exports.cleanText(context.content);
       }
-      const firstChangeset = makeSplice('\n', 0, 0, text);
-      await this.appendRevision(firstChangeset, authorId);
+      // The author *attribute* applied to the initial text — i.e. what colours
+      // it in the editor — is the stable system author when the content is
+      // auto-generated default text (#7885), or when non-empty text was
+      // supplied without an authorId (internal getPad calls during HTTP API
+      // setup, plugin-driven pad creation). The latter keeps the insert op
+      // carrying an `author` attribute, mirroring the substitution
+      // setText/appendText already do via spliceText.
+      const attribAuthorId =
+          ((usedDefaultContent || !authorId) && text.length > 0)
+            ? Pad.SYSTEM_AUTHOR_ID : authorId;
+      const firstAttribs = attribAuthorId
+          ? [['author', attribAuthorId] as [string, string]]
+          : undefined;
+      // The *revision* author (revs:0 meta.author) stays the real creator so
+      // pad ownership is preserved: isPadCreator() / the pad-wide settings gate
+      // and the deletion token all key off getRevisionAuthor(0). Only when no
+      // author was supplied at all do we fall back to the system author, so the
+      // initial revision still records a stable, non-empty author.
+      const revisionAuthorId =
+          authorId || (text.length > 0 ? Pad.SYSTEM_AUTHOR_ID : '');
+      const firstChangeset = makeSplice('\n', 0, 0, text, firstAttribs, this.pool);
+      await this.appendRevision(firstChangeset, revisionAuthorId);
     }
+    this.padSettings = Pad.normalizePadSettings(this.padSettings);
     await hooks.aCallAll('padLoad', {pad: this});
   }
 
   async copy(destinationID: string, force: boolean) {
+    // Reject a destinationID that isn't a valid pad id BEFORE any db write. The
+    // copy path writes `pad:${destinationID}...` records directly (bypassing
+    // getPad), so a destinationID carrying the ueberdb delimiter `:` would
+    // otherwise clobber another pad's internal sub-records and slip past the
+    // force=false existence guard. (GHSA-wg58-mhwv-35pq.)
+    if (!padManager.isValidPadId(destinationID)) {
+      throw new CustomError('destinationID is not a valid padId', 'apierror');
+    }
+
     // Kick everyone from this pad.
     // This was commented due to https://github.com/ether/etherpad-lite/issues/3183.
     // Do we really need to kick everyone out?
@@ -498,8 +829,14 @@ class Pad {
   }
 
   async copyPadWithoutHistory(destinationID: string, force: string|boolean, authorId = '') {
+    // See copy(): reject an invalid destinationID (notably one containing the
+    // ueberdb delimiter `:`) before any db write. (GHSA-wg58-mhwv-35pq.)
+    if (!padManager.isValidPadId(destinationID)) {
+      throw new CustomError('destinationID is not a valid padId', 'apierror');
+    }
+
     // flush the source pad
-    this.saveToDatabase();
+    await this.saveToDatabase();
 
     // if it's a group pad, let's make sure the group exists.
     const destGroupID = await this.checkIfGroupExistAndReturnIt(destinationID);
@@ -520,22 +857,58 @@ class Pad {
 
     const oldAText = this.atext;
 
+    // The author to attribute inserts to when the historical op lacks
+    // one (legacy server-internal flows / .etherpad imports). Caller-
+    // supplied authorId wins; otherwise the stable system author.
+    // appendRevision now requires every insert to carry an author, so
+    // unattributed ops in the source pad would otherwise throw here.
+    const replayAuthorId = authorId || Pad.SYSTEM_AUTHOR_ID;
+
     // based on Changeset.makeSplice
     const assem = new SmartOpAssembler();
-    for (const op of opsFromAText(oldAText)) assem.append(op);
-    assem.endDocument();
-
+    for (const op of opsFromAText(oldAText)) {
+      if (op.opcode === '+') {
+        const map = AttributeMap.fromString(op.attribs, dstPad.pool);
+        if (!map.get('author')) {
+          map.set('author', replayAuthorId);
+          op.attribs = map.toString();
+        }
+      }
+      assem.append(op);
+    }
     // although we have instantiated the dstPad with '\n', an additional '\n' is
     // added internally, so the pad text on the revision 0 is "\n\n"
     const oldLength = 2;
 
-    const newLength = assem.getLengthChange();
-    const newText = oldAText.text;
+    // opsFromAText() intentionally omits the source document's final newline,
+    // so the ops appended above insert oldAText.text minus its last character.
+    // Both of the destination pad's existing newlines would then survive and
+    // the copy would come out one newline longer than the source -- growing
+    // again on every subsequent copy. Delete one of them so the copy's text
+    // matches the source exactly.
+    const dropExtraNewline = new Op('-');
+    dropExtraNewline.chars = 1;
+    dropExtraNewline.lines = 1;
+    assem.append(dropExtraNewline);
+    assem.endDocument();
+
+    // pack() takes the TOTAL length of the new document, not the delta.
+    // Passing the delta (assem.getLengthChange()) produced a changeset whose
+    // header disagreed with its own ops, so every pad produced by this
+    // function failed checkRep() -- and therefore pad.check(), which is what
+    // `cleanup.keepRevisions` runs before it will touch a pad.
+    const newLength = oldLength + assem.getLengthChange();
+    // The char bank holds only the inserted characters, which is the source
+    // text without the final newline that opsFromAText() skipped.
+    const newText = oldAText.text.slice(0, -1);
 
     // create a changeset that removes the previous text and add the newText with
     // all atributes present on the source pad
     const changeset = pack(oldLength, newLength, assem.toString(), newText);
-    dstPad.appendRevision(changeset, authorId);
+    // Must be awaited: an un-awaited rejection here (an invalid changeset,
+    // a failed write) surfaces as an unhandled rejection instead of failing
+    // the copy, which is how the length bug above went unnoticed.
+    await dstPad.appendRevision(changeset, authorId);
 
     await hooks.aCallAll('padCopy', {
       get originalPad() {
@@ -588,13 +961,13 @@ class Pad {
     // delete all chat messages
     // @ts-ignore
     p.push(timesLimit(this.chatHead + 1, 500, async (i: string) => {
-      await this.db.remove(`pad:${this.id}:chat:${i}`, null);
+      await this.db.remove(`pad:${this.id}:chat:${i}`);
     }));
 
     // delete all revisions
     // @ts-ignore
     p.push(timesLimit(this.head + 1, 500, async (i: string) => {
-      await this.db.remove(`pad:${this.id}:revs:${i}`, null);
+      await this.db.remove(`pad:${this.id}:revs:${i}`);
     }));
 
     // remove pad from all authors who contributed
@@ -604,6 +977,7 @@ class Pad {
 
     // delete the pad entry and delete pad from padManager
     p.push(padManager.removePad(padID));
+    p.push(padDeletionManager.removeDeletionToken(padID));
     p.push(hooks.aCallAll('padRemove', {
       get padID() {
         pad_utils.warnDeprecated('padRemove padID context property is deprecated; use pad.id instead');
@@ -620,6 +994,8 @@ class Pad {
     await this.saveToDatabase();
   }
 
+  // Returns the newly created saved revision, or undefined if this revision
+  // was already saved (so callers can broadcast only genuine additions).
   async addSavedRevision(revNum: string, savedById: string, label: string) {
     // if this revision is already saved, return silently
     for (const i in this.savedRevisions) {
@@ -639,10 +1015,44 @@ class Pad {
     // save this new saved revision
     this.savedRevisions.push(savedRevision);
     await this.saveToDatabase();
+    return savedRevision;
   }
 
   getSavedRevisions() {
     return this.savedRevisions;
+  }
+
+  /**
+   * Scans `0..head` for revisions that are absent or unusable.
+   *
+   * `check()` already trips over these, but only as
+   * `assert(timestamp != null)` part-way through replaying the history --
+   * an assertion about a null timestamp, when what the operator needs to
+   * hear is "revision 600 is missing". This reports the gaps directly so
+   * callers can say something actionable instead. See #8134.
+   *
+   * Cheap relative to check(): it reads one sub-field per revision and
+   * replays nothing.
+   *
+   * @param limit Stop after this many gaps. A pad damaged by a failed
+   *     cleanup can be missing hundreds of revisions and the operator does
+   *     not need them all enumerated.
+   * @returns Ascending revision numbers with no usable stored record.
+   */
+  async findMissingRevisions(limit = 20): Promise<number[]> {
+    const missing: number[] = [];
+    const revs = Stream.range(0, this.getHeadRevisionNumber() + 1)
+        .map(async (r: number) => [r, await this.getRevisionDate(r)])
+        .batch(100).buffer(99);
+    for await (const [r, timestamp] of revs) {
+      // A record that exists but carries no meta.timestamp is just as
+      // unreplayable as one that is absent, and fails check() identically.
+      if (timestamp == null) {
+        missing.push(r);
+        if (missing.length >= limit) break;
+      }
+    }
+    return missing;
   }
 
   /**
@@ -704,8 +1114,7 @@ class Pad {
               isKeyRev ? this._getKeyRevisionAText(r) : null,
             ]);
           } catch (err:any) {
-            err.message = `(pad ${this.id} revision ${r}) ${err.message}`;
-            throw err;
+            throw addErrorContext(err, `(pad ${this.id} revision ${r})`);
           }
         })
         .batch(100).buffer(99);
@@ -721,6 +1130,12 @@ class Pad {
         assert(changeset != null);
         assert.equal(typeof changeset, 'string');
         checkRep(changeset);
+        // NOTE: pad.check() intentionally does not invoke
+        // _assertInsertOpsCarryAuthor — it runs against historical
+        // stored data (including legacy .etherpad files) where some
+        // server-internal flows did not previously substitute the
+        // system author. The write-time guard in appendRevision is
+        // where the invariant is enforced for new content.
         const unpacked = unpack(changeset);
         let text = atext.text;
         for (const op of deserializeOps(unpacked.ops)) {
@@ -737,8 +1152,7 @@ class Pad {
         atext = applyToAText(changeset, atext, pool);
         if (isKeyRev) assert.deepEqual(keyAText, atext);
       } catch (err:any) {
-        err.message = `(pad ${this.id} revision ${r}) ${err.message}`;
-        throw err;
+        throw addErrorContext(err, `(pad ${this.id} revision ${r})`);
       }
     }
     assert.equal(this.text(), atext.text);
@@ -755,8 +1169,7 @@ class Pad {
             assert(msg != null);
             assert(msg instanceof ChatMessage);
           } catch (err:any) {
-            err.message = `(pad ${this.id} chat message ${c}) ${err.message}`;
-            throw err;
+            throw addErrorContext(err, `(pad ${this.id} chat message ${c})`);
           }
         })
         .batch(100).buffer(99);

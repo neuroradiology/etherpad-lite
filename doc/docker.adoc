@@ -11,7 +11,7 @@ If you are ok downloading a https://hub.docker.com/r/etherpad/etherpad[prebuilt 
 docker pull etherpad/etherpad
 
 # gets a specific version
-docker pull etherpad/etherpad:1.8.0
+docker pull etherpad/etherpad:2.6.1
 ----
 
 === Build a personalized container
@@ -62,29 +62,17 @@ The variable value has to be a space separated, double quoted list of plugin nam
 
 Some plugins will need personalized settings. Just refer to the previous section, and include them in your custom `settings.json.docker`.
 
-==== Rebuilding including export functionality for DOC/PDF/ODT
+==== Office-format import/export
 
-If you want to be able to export your pads to DOC/PDF/ODT files, you can install
-either Abiword or Libreoffice via setting a build variable.
+DOCX export, PDF export, and DOCX import work out of the box — Etherpad
+ships pure-JS in-process converters and needs no extra dependencies for
+those three formats.
 
-===== Via Abiword
-
-For installing Abiword, set the `INSTALL_ABIWORD` build variable to any value.
-
-Also, you will need to configure the path to the abiword executable
-via setting the `abiword` property in `<BASEDIR>/settings.json.docker` to
-`/usr/bin/abiword` or via setting the environment variable  `ABIWORD` to
-`/usr/bin/abiword`.
-
-===== Via Libreoffice
-
-For installing Libreoffice instead, set the `INSTALL_SOFFICE` build variable
-to any value.
-
-Also, you will need to configure the path to the libreoffice executable
-via setting the `soffice` property in `<BASEDIR>/settings.json.docker` to
-`/usr/bin/soffice` or via setting the environment variable  `SOFFICE` to
-`/usr/bin/soffice`.
+DOC/ODT/RTF export and PDF import still require LibreOffice. To enable
+them, install LibreOffice via the `INSTALL_SOFFICE` build variable (any
+value), and either set the `soffice` property in
+`<BASEDIR>/settings.json.docker` to `/usr/bin/soffice` or set the
+`SOFFICE` environment variable to `/usr/bin/soffice`.
 
 ==== Examples
 
@@ -464,12 +452,8 @@ For the editor container, you can also make it full width by adding `full-width-
 | How long may clients use served javascript code (in seconds)? Not setting this may cause problems during deployment. Set to 0 to disable caching.
 | `21600` (6 hours)
 
-| `ABIWORD`
-| Absolute path to the Abiword executable. Abiword is needed to get advanced import/export features of pads. Setting it to null disables Abiword and will only allow plain text and HTML import/exports.
-| `null`
-
 | `SOFFICE`
-| This is the absolute path to the soffice executable. LibreOffice can be used in lieu of Abiword to export pads. Setting it to null disables LibreOffice exporting.
+| Absolute path to the soffice (LibreOffice) executable. When configured, all advanced import/export formats use it (docx, pdf, odt, doc, rtf). Setting it to null falls back to in-process pure-JS converters: docx and pdf export, plus docx import, still work; odt/doc/rtf and pdf import remain unavailable.
 | `null`
 
 | `ALLOW_UNKNOWN_FILE_ENDS`

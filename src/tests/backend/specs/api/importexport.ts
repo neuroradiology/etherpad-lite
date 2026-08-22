@@ -66,7 +66,7 @@ const testImports:MapArrayType<any> = {
   'indentedListsAreNotBullets': {
     description: 'Indented lists are represented with tabs and without bullets',
     input: '<html><body><ul class="indent"><li>indent</li><li>indent</ul></body></html>',
-    wantHTML: '<!DOCTYPE HTML><html><body><ul class="indent"><li>indent</li><li>indent</ul><br></body></html>',
+    wantHTML: '<!DOCTYPE HTML><html><body><ul class="indent" style="list-style-type: none;"><li>indent</li><li>indent</ul><br></body></html>',
     wantText: '\tindent\n\tindent\n\n',
   },
   'lineWithMultipleSpaces': {
@@ -79,8 +79,8 @@ const testImports:MapArrayType<any> = {
     // XXX the HTML between "than" and "one" looks strange
     description: 'non-breaking space should be preserved, but can be replaced when it',
     input: '<html><body>Text&nbsp;with&nbsp; more&nbsp;&nbsp;&nbsp;than   &nbsp;one space.<br></body></html>',
-    wantHTML: '<!DOCTYPE HTML><html><body>Text with&nbsp; more&nbsp;&nbsp; than&nbsp; one space.<br><br></body></html>',
-    wantText: 'Text with  more   than  one space.\n\n',
+    wantHTML: '<!DOCTYPE HTML><html><body>Text&nbsp;with&nbsp; more&nbsp;&nbsp;&nbsp;than&nbsp; one space.<br><br></body></html>',
+    wantText: 'Text\u00a0with  more\u00a0\u00a0\u00a0than  one space.\n\n',
   },
   'multiplenbsp': {
     description: 'Multiple non-breaking space should be preserved',
@@ -91,8 +91,8 @@ const testImports:MapArrayType<any> = {
   'multipleNonBreakingSpaceBetweenWords': {
     description: 'A normal space is always inserted before a word',
     input: '<html><body>&nbsp;&nbsp;word1&nbsp;&nbsp;word2&nbsp;&nbsp;&nbsp;word3<br></body></html>',
-    wantHTML: '<!DOCTYPE HTML><html><body>&nbsp; word1&nbsp; word2&nbsp;&nbsp; word3<br><br></body></html>',
-    wantText: '  word1  word2   word3\n\n',
+    wantHTML: '<!DOCTYPE HTML><html><body>&nbsp; word1&nbsp;&nbsp;word2&nbsp;&nbsp;&nbsp;word3<br><br></body></html>',
+    wantText: '  word1\u00a0\u00a0word2\u00a0\u00a0\u00a0word3\n\n',
   },
   'nonBreakingSpacePreceededBySpaceBetweenWords': {
     description: 'A non-breaking space preceded by a normal space',

@@ -658,13 +658,38 @@ export class Html10n {
       prop = document.body.textContent ? 'textContent' : 'innerText'
     }
 
+    // Populate aria-label from the translation so screen readers get a
+    // localized accessible name. Preserve an author-supplied aria-label
+    // (one present in the template without a marker), but keep our own
+    // html10n-generated values in sync across language changes by
+    // overwriting them. The `data-l10n-aria-label` marker distinguishes
+    // the two: set when we populate it, checked on subsequent passes so
+    // `pad.applyLanguage()` refreshes the accessible name.
+    // See PR #7584 review feedback.
+    const generatedMarker = 'data-l10n-aria-label';
+    const populateAriaLabel = () => {
+      if (!node.hasAttribute('aria-label') ||
+          node.getAttribute(generatedMarker) === 'true') {
+        node.setAttribute('aria-label', str.str!);
+        node.setAttribute(generatedMarker, 'true');
+      }
+    }
+
     // Apply translation
     if (node.children.length === 0 || prop != 'textContent') {
       // @ts-ignore
       node[prop] = str.str!
-      node.setAttribute("aria-label", str.str!); // Sets the aria-label
-      // The idea of the above is that we always have an aria value
-      // This might be a bit of an abrupt solution but let's see how it goes
+      populateAriaLabel()
+    } else if (node.tagName === 'SELECT' || node.tagName === 'INPUT' ||
+               node.tagName === 'TEXTAREA') {
+      // Form-controllable elements carry their accessible name on aria-label
+      // rather than as text content — a <select>'s text is its <option>
+      // labels, not its own name. Plugins that put `data-l10n-id` on a
+      // <select> (ep_headings2, ep_align, ep_font_size, …) used to trigger a
+      // spurious "could not translate element content" warning here because
+      // the text-node hunt below finds nothing to write. Short-circuit and
+      // just localize aria-label. See ether/ep_align#182 review.
+      populateAriaLabel()
     } else {
       let children = node.childNodes,
         found = false
@@ -995,8 +1020,7 @@ export default html10n
 // @ts-ignore
 window.html10n = html10n
 
-// gettext-like shortcut
-if (window._ === undefined){
-  // @ts-ignore
-  window._ = html10n.get;
-}
+// gettext-like shortcut — always set this so plugins can use window._() for localization.
+// Internal code uses underscore via require(), not window._, so this is safe.
+// @ts-ignore
+window._ = html10n.get;

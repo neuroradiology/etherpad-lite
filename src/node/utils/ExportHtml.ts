@@ -63,7 +63,12 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
     // like <span data-tag="value">
     hooks.aCallAll('exportHtmlAdditionalTagsWithData', pad).then((newProps: string[]) => {
       newProps.forEach((prop) => {
-        tags.push(`span data-${prop[0]}="${prop[1]}"`);
+        // Attribute names/values here originate from the pad's attribute pool
+        // (user content), so escape the value and constrain the data-* name
+        // before interpolating, consistent with the escaping already applied to
+        // exported URLs and text below.
+        const dataName = String(prop[0]).replace(/[^a-zA-Z0-9_-]/g, '');
+        tags.push(`span data-${dataName}="${Security.escapeHTMLAttribute(String(prop[1]))}"`);
         props.push(prop);
       });
     }),
@@ -254,8 +259,7 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
 
         let s = taker.take(chars);
 
-        // removes the characters with the code 12. Don't know where they come
-        // from but they break the abiword parser and are completly useless
+        // form feed (0x0C) is a legacy control char with no meaning in HTML
         s = s.replace(String.fromCharCode(12), '');
 
         assem.append(_encodeWhitespace(Security.escapeHTML(s)));
@@ -309,6 +313,9 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
   }
 
   let openLists: openList[] = [];
+  // Track running ordered-list item counts per indent level so that when an <ol>
+  // is reopened after an unordered-list interruption we can emit start="N".
+  const olItemCounts: MapArrayType<number> = {};
   for (let i = 0; i < textLines.length; i++) {
     let context;
     const line = _analyzeLine(textLines[i], attribLines[i], apool);
@@ -388,22 +395,30 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
             }
 
             if (line.listTypeName === 'number') {
-              // We introduce line.start here, this is useful for continuing
-              // Ordered list line numbers
-              // in case you have a bullet in a list IE you Want
-              // 1. hello
-              //   * foo
-              // 2. world
-              // Without this line.start logic it would be
-              // 1. hello * foo 1. world because the bullet would kill the OL
-
-              // TODO: This logic could also be used to continue OL with indented content
-              // but that's a job for another day....
-              if (line.start) {
-                pieces.push(`<ol start="${Number(line.start)}" class="${line.listTypeName}">`);
-              } else {
+              if (olItemCounts[line.listLevel] != null && olItemCounts[line.listLevel] > 0) {
+                // Continue numbering after an unordered-list interruption
+                const startNum = olItemCounts[line.listLevel] + 1;
+                pieces.push(`<ol start="${startNum}" class="${line.listTypeName}">`);
+              } else if (olItemCounts[line.listLevel] != null) {
+                // Counter exists but is 0 — level was explicitly reset (e.g. a
+                // nested list was closed). Start fresh without a start attribute.
                 pieces.push(`<ol class="${line.listTypeName}">`);
+              } else {
+                // No counter yet. Use explicit start attribute when present
+                // (e.g. from import or internal logic) and seed the counter so
+                // subsequent continuations stay aligned.
+                const explicitStart = Number(line.start);
+                if (Number.isFinite(explicitStart) && explicitStart > 0) {
+                  pieces.push(`<ol start="${explicitStart}" class="${line.listTypeName}">`);
+                  olItemCounts[line.listLevel] = explicitStart - 1;
+                } else {
+                  pieces.push(`<ol class="${line.listTypeName}">`);
+                }
               }
+            } else if (line.listTypeName === 'indent') {
+              // Indent lines are plain indented text, not list items.
+              // Use a ul with list-style-type:none so they don't show bullets.
+              pieces.push(`<ul class="${line.listTypeName}" style="list-style-type: none;">`);
             } else {
               pieces.push(`<ul class="${line.listTypeName}">`);
             }
@@ -413,6 +428,14 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
       // if we're going up a level we shouldn't be adding..
       if (context.lineContent) {
         pieces.push('<li>', context.lineContent);
+        // Track ordered-list item counts so we can continue numbering after interruptions
+        if (line.listTypeName === 'number') {
+          if (!olItemCounts[line.listLevel]) {
+            olItemCounts[line.listLevel] = 1;
+          } else {
+            olItemCounts[line.listLevel]++;
+          }
+        }
       }
 
       // To close list elements
@@ -438,12 +461,26 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
         if (nextLine && nextLine.listLevel) {
           nextLevel = nextLine.listLevel;
         }
+        // The actual depth the next line lives at (ignoring type changes)
+        const actualNextLevel = (nextLine && nextLine.listLevel) ? nextLine.listLevel : 0;
         if (nextLine && line.listTypeName !== nextLine.listTypeName) {
           nextLevel = 0;
         }
 
         for (let diff = nextLevel; diff < line.listLevel; diff++) {
           openLists = openLists.filter((el) => el.level !== diff && el.type !== line.listTypeName);
+
+          // Reset counter for levels that are genuinely closing (depth decrease),
+          // not merely changing type at the same depth. Type changes should
+          // preserve counters so numbering can continue after interruptions.
+          // Use 0 as sentinel (not delete) so the ol-opening logic knows this
+          // level was explicitly reset and won't fall back to line.start.
+          // Only reset when closing an ordered list — closing an unordered list
+          // at the same level must not poison the ol counter for a future
+          // unrelated ol at this level (which would still want line.start).
+          if (line.listTypeName === 'number' && diff + 1 > actualNextLevel) {
+            olItemCounts[diff + 1] = 0;
+          }
 
           if (pieces[pieces.length - 1].indexOf('</ul') === 0 ||
               pieces[pieces.length - 1].indexOf('</ol') === 0) {
@@ -458,6 +495,10 @@ const getHTMLFromAtext = async (pad:PadType, atext: AText, authorColors?: string
         }
       }
     } else {
+      // outside any list — reset ordered-list counters for all levels
+      for (const key of Object.keys(olItemCounts)) {
+        delete olItemCounts[key];
+      }
       // outside any list, need to close line.listLevel of lists
       context = {
         line,
@@ -496,6 +537,7 @@ exports.getPadHTMLDocument = async (padId: string, revNum: string, readOnlyId: n
     body: html,
     padId: Security.escapeHTML(readOnlyId || padId),
     extraCSS: stylesForExportCSS,
+    proxyPath: '',
   });
 };
 
@@ -504,13 +546,16 @@ const _processSpaces = (s: string) => {
   const doesWrap = true;
   if (s.indexOf('<') < 0 && !doesWrap) {
     // short-cut
-    return s.replace(/ /g, '&nbsp;');
+    return s.replace(/[ \u00a0]/g, '&nbsp;');
   }
-  const parts = [];
-  s.replace(/<[^>]*>?| |[^ <]+/g, (m) => {
+  const parts: string[] = [];
+  s.replace(/<[^>]*>?|[ \u00a0]|[^ \u00a0<]+/g, (m) => {
     parts.push(m);
     return m
   });
+  // U+00A0 is content for run-bookkeeping - it terminates a space run
+  // just like a word character would, so runs of regular spaces adjacent
+  // to a nbsp are not miscounted as one long run (issue #3037).
   if (doesWrap) {
     let endOfLine = true;
     let beforeSpace = false;
@@ -544,6 +589,9 @@ const _processSpaces = (s: string) => {
         parts[i] = '&nbsp;';
       }
     }
+  }
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === '\u00a0') parts[i] = '&nbsp;';
   }
   return parts.join('');
 };

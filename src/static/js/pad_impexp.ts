@@ -144,24 +144,18 @@ const padimpexp = (() => {
       $('#exportetherpada').attr('href', `${padRootPath}/export/etherpad`);
       $('#exportplaina').attr('href', `${padRootPath}/export/txt`);
 
-      // hide stuff thats not avaible if abiword/soffice is disabled
+      // DOCX and PDF are always available — soffice when configured,
+      // native pure-JS converters otherwise (issue #7538). ODT still
+      // requires soffice. The 'withoutPDF' branch (Windows soffice
+      // without PDF) is handled by the server-side cascade routing
+      // PDF through native; the UI link stays.
+      const wordFormat = clientVars.docxExport ? 'docx' : 'doc';
+      $('#exportworda').attr('href', `${padRootPath}/export/${wordFormat}`);
+      $('#exportpdfa').attr('href', `${padRootPath}/export/pdf`);
       if (clientVars.exportAvailable === 'no') {
-        $('#exportworda').remove();
-        $('#exportpdfa').remove();
         $('#exportopena').remove();
-
-        $('#importmessageabiword').show();
-      } else if (clientVars.exportAvailable === 'withoutPDF') {
-        $('#exportpdfa').remove();
-
-        $('#exportworda').attr('href', `${padRootPath}/export/doc`);
-        $('#exportopena').attr('href', `${padRootPath}/export/odt`);
-
-        $('#importexport').css({height: '142px'});
-        $('#importexportline').css({height: '142px'});
+        $('#importmessagenoconverter').prop('hidden', false);
       } else {
-        $('#exportworda').attr('href', `${padRootPath}/export/doc`);
-        $('#exportpdfa').attr('href', `${padRootPath}/export/pdf`);
         $('#exportopena').attr('href', `${padRootPath}/export/odt`);
       }
 

@@ -31,12 +31,13 @@ import Op from "./Op";
 const _MAX_LIST_LEVEL = 16;
 
 import AttributeMap from './AttributeMap';
-import UNorm from 'unorm';
 import {subattribution} from './Changeset';
 import {SmartOpAssembler} from "./SmartOpAssembler";
 const hooks = require('./pluginfw/hooks');
 
-const sanitizeUnicode = (s) => UNorm.nfc(s);
+// NFC-normalize via the native String API (replaces the unmaintained `unorm`
+// polyfill; String.prototype.normalize is available in every supported runtime).
+const sanitizeUnicode = (s: string) => s.normalize('NFC');
 const tagName = (n) => n.tagName && n.tagName.toLowerCase();
 // supportedElems are Supported natively within Etherpad and don't require a plugin
 const supportedElems = new Set([
@@ -79,8 +80,30 @@ const makeContentCollector = (collectStyles, abrowser, apool, className2Author) 
   const textify = (str) => sanitizeUnicode(
       str.replace(/(\n | \n)/g, ' ')
           .replace(/[\n\r ]/g, ' ')
-          .replace(/\xa0/g, ' ')
           .replace(/\t/g, '        '));
+
+  // processSpaces (domline.ts, ExportHtml.ts) is a lossy one-way display
+  // transform: leading/trailing spaces and all-but-the-last space in a run
+  // are rendered as &nbsp; to defeat HTML whitespace collapsing, so any
+  // round-trip through the DOM sees nbsps where the model has plain spaces.
+  // To keep the model canonical, a [ \u00a0]+ run read back from the fully
+  // assembled line is collapsed to plain spaces unless it is strictly
+  // interior to non-whitespace chars AND contains only U+00A0 (issue #3037 -
+  // user-intended nbsp between words such as "100 km"). The rule runs on
+  // the whole line (not per DOM text node) so that nbsps sitting at a
+  // span boundary - e.g. <span>100</span><span>&nbsp;km</span> - are still
+  // seen as interior. The transform is length-preserving so attribution
+  // offsets stay consistent.
+  const canonicalizeNbspRuns = (s: string) => s.replace(
+      /[ \u00a0]+/g,
+      (run: string, offset: number, src: string) => {
+        const before = offset > 0 ? src[offset - 1] : '';
+        const after = offset + run.length < src.length
+            ? src[offset + run.length] : '';
+        const pureNbsp = !run.includes(' ');
+        const interiorOfWord = /\S/.test(before) && /\S/.test(after);
+        return pureNbsp && interiorOfWord ? run : ' '.repeat(run.length);
+      });
 
   const getAssoc = (node, name) => node[`_magicdom_${name}`];
 
@@ -504,9 +527,14 @@ const makeContentCollector = (collectStyles, abrowser, apool, className2Author) 
             // See https://github.com/ether/etherpad-lite/issues/2412 for reasoning
             if (!abrowser.chrome) oldListTypeOrNull = (_enterList(state, undefined) || 'none');
           } else if (tname === 'li') {
+            // If the <li> has no parent <ul>/<ol> (e.g., pasted bare HTML), default to bullet list.
+            // See https://github.com/ether/etherpad-lite/issues/6665
+            if (!state.lineAttributes.list) {
+              oldListTypeOrNull = (_enterList(state, 'bullet1') || 'none');
+            }
             state.lineAttributes.start = state.start || 0;
             _recalcAttribString(state);
-            if (state.lineAttributes.list.indexOf('number') !== -1) {
+            if (state.lineAttributes.list && state.lineAttributes.list.indexOf('number') !== -1) {
               /*
                Nested OLs are not --> <ol><li>1</li><ol>nested</ol></ol>
                They are           --> <ol><li>1</li><li><ol><li>nested</li></ol></li></ol>
@@ -636,6 +664,12 @@ const makeContentCollector = (collectStyles, abrowser, apool, className2Author) 
 
     lineStrings.length--;
     lineAttribs.length--;
+
+    // Canonicalize display-artifact nbsps on the whole-line string (issue
+    // #3037). Length-preserving, so no attribute adjustments are required.
+    for (let i = 0; i < lineStrings.length; i++) {
+      lineStrings[i] = canonicalizeNbspRuns(lineStrings[i]);
+    }
 
     const ss = getSelectionStart();
     const se = getSelectionEnd();

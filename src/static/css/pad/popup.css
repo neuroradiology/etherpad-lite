@@ -28,8 +28,19 @@
   border: 1px solid #ccc;
   box-shadow: 0 2px 4px #ddd;
   background: #f7f7f7;
-  min-width: 300px;
-  max-width: 600px;
+  min-width: min(300px, 90vw);
+  max-width: min(600px, 95vw);
+  /* Constrain height so popups (notably Settings with Pad-wide Settings
+     enabled) scroll instead of cropping items off-screen on short windows.
+     Fixes #7696. */
+  max-height: calc(100vh - 20px);
+  overflow-y: auto;
+}
+
+/* Chat manages its own scroll and floats author-colour pickers outside the
+   popup, so it must not become a scroll container. */
+.popup#users .popup-content {
+  overflow: visible;
 }
 .popup input[type=text] {
   width: 100%;
@@ -53,6 +64,17 @@
   margin: 5px 0;
 }
 
+/* When a settings checkbox is disabled (e.g. "Chat always on screen" while
+   "Disable chat" is ticked), the browser greys the checkbox itself but the
+   adjacent `<label>` still looks active, leaving the row visually clickable
+   even though it isn't. Match the row to the checkbox's disabled state.
+   Fixes #7592. */
+.popup input[type="checkbox"]:disabled + label,
+.popup input[type="radio"]:disabled + label {
+  color: #999;
+  cursor: not-allowed;
+}
+
 /* Mobile devices */
 @media only screen and (max-width: 800px) {
   .popup {
@@ -65,10 +87,6 @@
   }
   .popup-content {
     max-height: 80vh;
-    overflow: auto;
-  }
-  .popup#users .popup-content {
-    overflow: visible;
   }
 }
 /* Move popup to the bottom, except popup linked to left toolbar, like hyperklink popup */

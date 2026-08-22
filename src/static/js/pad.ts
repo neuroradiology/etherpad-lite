@@ -42,6 +42,7 @@ const getCollabClient = require('./collab_client').getCollabClient;
 const padconnectionstatus = require('./pad_connectionstatus').padconnectionstatus;
 const padcookie = require('./pad_cookie').padcookie;
 const padeditbar = require('./pad_editbar').padeditbar;
+const padMode = require('./pad_mode').padMode;
 const padeditor = require('./pad_editor').padeditor;
 const padimpexp = require('./pad_impexp').padimpexp;
 const padmodals = require('./pad_modals').padmodals;
@@ -53,6 +54,8 @@ import {randomString} from "./pad_utils";
 const socketio = require('./socketio');
 
 const hooks = require('./pluginfw/hooks');
+import {showPrivacyBannerIfEnabled} from './privacy_banner';
+import {maybeShowOutdatedNotice} from './pad_outdated_notice';
 
 // This array represents all GET-parameters which can be used to change a setting.
 //   name:     the parameter-name, eg  `?noColors=true`  =>  `noColors`
@@ -70,6 +73,15 @@ const getParameters = [
     },
   },
   {
+    name: 'fadeInactiveAuthorColors',
+    checkVal: 'false',
+    callback: (val) => {
+      if (!clientVars.initialOptions) return;
+      if (!clientVars.initialOptions.view) clientVars.initialOptions.view = {};
+      clientVars.initialOptions.view.fadeInactiveAuthorColors = false;
+    },
+  },
+  {
     name: 'showControls',
     checkVal: 'true',
     callback: (val) => {
@@ -77,13 +89,34 @@ const getParameters = [
     },
   },
   {
+    // showMenuRight accepts 'true' or 'false'. Explicit 'false' hides the
+    // right-side toolbar (import/export/timeslider/settings/embed/home/
+    // users) — useful for iframe-embedded readonly pads where the menu
+    // is just chrome (issue #5182). Explicit 'true' forces the menu
+    // visible (a no-op against the default, kept for symmetry and for
+    // overriding any future caller-applied hide). Any other value is a
+    // no-op — the menu stays in its default state.
+    name: 'showMenuRight',
+    checkVal: null,
+    callback: (val) => {
+      if (val === 'false') {
+        $('#editbar .menu_right').hide();
+      } else if (val === 'true') {
+        $('#editbar .menu_right').show();
+      }
+    },
+  },
+  {
     name: 'showChat',
     checkVal: null,
     callback: (val) => {
+      clientVars.initialOptions.showChat = val !== 'false';
       if (val === 'false') {
         settings.hideChat = true;
         chat.hide();
         $('#chaticon').hide();
+      } else {
+        settings.hideChat = false;
       }
     },
   },
@@ -105,6 +138,14 @@ const getParameters = [
     name: 'userName',
     checkVal: null,
     callback: (val) => {
+      // The default for globalUserName/globalUserColor is the boolean `false`
+      // (sentinel meaning "no enforced value"). Older settings.json files used
+      // boolean `false` for these options too, which getParams() coerces to
+      // the string "false" — that fooled the !== false sentinel checks at
+      // _afterHandshake and shipped the literal string "false" as the user's
+      // name and color (#7686). Reject the sentinel string here so URL
+      // parameters like ?userName=false also no-op.
+      if (!val || val === 'false') return;
       settings.globalUserName = val;
       clientVars.userName = val;
     },
@@ -113,15 +154,17 @@ const getParameters = [
     name: 'userColor',
     checkVal: null,
     callback: (val) => {
+      if (!val || val === 'false') return;
       settings.globalUserColor = val;
       clientVars.userColor = val;
     },
   },
   {
     name: 'rtl',
-    checkVal: 'true',
-    callback: (val) => {
-      settings.rtlIsTrue = true;
+    checkVal: null,
+    callback: (val, fromUrl) => {
+      settings.rtlIsTrue = val === 'true';
+      if (fromUrl) settings.rtlIsExplicit = true;
     },
   },
   {
@@ -144,33 +187,113 @@ const getParameters = [
     callback: (val) => {
       console.log('Val is', val)
       html10n.localize([val, 'en']);
-      Cookies.set('language', val);
+      const prefix = (window as any).clientVars?.cookiePrefix || '';
+      Cookies.set(`${prefix}language`, val);
     },
   },
 ];
 
 const getParams = () => {
-  // Tries server enforced options first..
-  for (const setting of getParameters) {
-    let value = clientVars.padOptions[setting.name];
-    if (value == null) continue;
-    value = value.toString();
-    if (value === setting.checkVal || setting.checkVal == null) {
-      setting.callback(value);
-    }
-  }
-
-  // Then URL applied stuff
   const params = getUrlVars();
+
   for (const setting of getParameters) {
-    const value = params.get(setting.name);
-    if (value && (value === setting.checkVal || setting.checkVal == null)) {
-      setting.callback(value);
+    // URL query params take priority over server-enforced options.
+    // This prevents race conditions where both fire async callbacks
+    // (e.g., lang setting triggers html10n.localize twice).
+    const urlValue = params.get(setting.name);
+    if (urlValue && (urlValue === setting.checkVal || setting.checkVal == null)) {
+      setting.callback(urlValue, true);
+      continue;
+    }
+
+    // Fall back to server-enforced option
+    let serverValue = clientVars.padOptions[setting.name];
+    if (serverValue == null) continue;
+    serverValue = serverValue.toString();
+    if (serverValue === setting.checkVal || setting.checkVal == null) {
+      setting.callback(serverValue, false);
     }
   }
 };
 
 const getUrlVars = () => new URL(window.location.href).searchParams;
+
+const getCookieLanguage = () => {
+  const cp = (window as any).clientVars?.cookiePrefix || '';
+  return Cookies.get(`${cp}language`) || Cookies.get('language');
+};
+
+const getMyViewOverrides = () => {
+  const language = getCookieLanguage();
+  const overrides = {
+    showChat: padcookie.getPref('showChat'),
+    alwaysShowChat: padcookie.getPref('chatAlwaysVisible'),
+    chatAndUsers: padcookie.getPref('chatAndUsers'),
+    lang: language,
+    view: {
+      showAuthorColors: padcookie.getPref('showAuthorshipColors'),
+      showLineNumbers: padcookie.getPref('showLineNumbers'),
+      rtlIsTrue: padcookie.getPref('rtlIsTrue'),
+      padFontFamily: padcookie.getPref('padFontFamily'),
+      fadeInactiveAuthorColors: padcookie.getPref('fadeInactiveAuthorColors'),
+    },
+  };
+  if (language == null) delete overrides.lang;
+  return overrides;
+};
+
+const normalizeChatOptions = (options) => {
+  if (options.showChat === false) {
+    options.alwaysShowChat = false;
+    options.chatAndUsers = false;
+  }
+  if (options.chatAndUsers === true) {
+    options.showChat = true;
+    options.alwaysShowChat = true;
+  } else if (options.alwaysShowChat === true) {
+    options.showChat = true;
+  }
+  return options;
+};
+
+// Surfaces the one-time pad deletion token when the server sends it in
+// clientVars (creator session, first CLIENT_READY). The token is cleared from
+// clientVars on acknowledgement so it is not re-exposed to later code paths.
+const showDeletionTokenModalIfPresent = () => {
+  const token: string | null = (window as any).clientVars?.padDeletionToken;
+  if (!token) return;
+  const $modal = $('#deletiontoken-modal');
+  const $input = $('#deletiontoken-value');
+  const $copy = $('#deletiontoken-copy');
+  const $ack = $('#deletiontoken-ack');
+  if ($modal.length === 0) return;
+
+  $input.val(token);
+  const previouslyFocused = document.activeElement as HTMLElement | null;
+  $modal.prop('hidden', false).addClass('popup-show');
+  // Focus the token input so screen readers announce the dialog body and the
+  // user lands on the value they need to copy.
+  setTimeout(() => ($input[0] as HTMLInputElement)?.focus(), 0);
+
+  $copy.off('click.gdpr').on('click.gdpr', async () => {
+    try {
+      await navigator.clipboard.writeText(token);
+    } catch (_e) {
+      ($input[0] as HTMLInputElement).select();
+      document.execCommand('copy');
+    }
+    $copy.text(html10n.get('pad.deletionToken.copied'));
+  });
+
+  $ack.off('click.gdpr').on('click.gdpr', () => {
+    $input.val('');
+    $modal.prop('hidden', true).removeClass('popup-show');
+    (window as any).clientVars.padDeletionToken = null;
+    if (previouslyFocused && document.body.contains(previouslyFocused)) {
+      previouslyFocused.focus();
+    }
+  });
+};
 
 const sendClientReady = (isReconnect) => {
   let padId = document.location.pathname.substring(document.location.pathname.lastIndexOf('/') + 1);
@@ -183,11 +306,10 @@ const sendClientReady = (isReconnect) => {
     document.title = `${padId.replace(/_+/g, ' ')} | ${title}`;
   }
 
-  let token = Cookies.get('token');
-  if (token == null || !padutils.isValidAuthorToken(token)) {
-    token = padutils.generateAuthorToken();
-    Cookies.set('token', token, {expires: 60});
-  }
+  // The author token lives in an HttpOnly cookie set by the server (GDPR PR3 /
+  // ether/etherpad#6701). The integrator-set `sessionID` cookie can also be
+  // HttpOnly now (issue #7045). The browser never reads or writes either; the
+  // server reads them from the socket.io handshake inside handleClientReady.
 
   // If known, propagate the display name and color to the server in the CLIENT_READY message. This
   // allows the server to include the values in its reply CLIENT_VARS message (which avoids
@@ -199,14 +321,25 @@ const sendClientReady = (isReconnect) => {
     name: params.get('userName'),
   };
 
-  const msg = {
+  // The integrator-set `sessionID` cookie is read server-side from the
+  // socket.io handshake (issue #7045) so it can be HttpOnly. We no longer
+  // forward it via the CLIENT_READY payload.
+  const msg: any = {
     component: 'pad',
     type: 'CLIENT_READY',
     padId,
-    sessionID: Cookies.get('sessionID'),
-    token,
     userInfo,
   };
+  const overrides = getMyViewOverrides();
+  const viewOverrides = Object.fromEntries(
+      Object.entries(overrides.view || {}).filter(([, v]) => v != null));
+  const hasTopLevelOverrides = ['showChat', 'alwaysShowChat', 'chatAndUsers', 'lang']
+      .some((k) => overrides[k] != null);
+  if (Object.keys(viewOverrides).length > 0 || hasTopLevelOverrides) {
+    if (Object.keys(viewOverrides).length > 0) overrides.view = viewOverrides;
+    else delete overrides.view;
+    msg.padSettingsDefaults = overrides;
+  }
 
   // this is a reconnect, lets tell the server our revisionnumber
   if (isReconnect) {
@@ -265,14 +398,26 @@ const handshake = async () => {
 
   socket.on('shout', (obj) => {
     if(obj.type === "COLLABROOM") {
-      let date = new Date(obj.data.payload.timestamp);
+      const payload = obj.data.payload;
+      const msgObj = payload?.message || {};
+      // Pad-deletion denial shouts are surfaced inline by pad_editor.ts as an
+      // alert tied to the delete action; suppress the global "Admin message"
+      // gritter so the user doesn't see a confusing duplicate.
+      if (typeof msgObj.messageKey === 'string'
+          && msgObj.messageKey.startsWith('pad.deletionToken.')) return;
+      // Updater drain announcements get their own title and dodge the generic
+      // "Admin message" framing so the user knows it's a system event.
+      const isUpdate = typeof msgObj.messageKey === 'string'
+          && msgObj.messageKey.startsWith('update.drain.');
+      const text = msgObj.messageKey
+          ? html10n.get(msgObj.messageKey, msgObj.values || {})
+          : msgObj.message;
+      if (!text) return;
+      const date = new Date(payload.timestamp);
       $.gritter.add({
-        // (string | mandatory) the heading of the notification
-        title: 'Admin message',
-        // (string | mandatory) the text inside the notification
-        text: '[' + date.toLocaleTimeString() + ']: ' + obj.data.payload.message.message,
-        // (bool | optional) if you want it to fade out on its own or just sit there
-        sticky: obj.data.payload.message.sticky
+        title: isUpdate ? html10n.get('update.banner.title') : 'Admin message',
+        text: '[' + date.toLocaleTimeString() + ']: ' + text,
+        sticky: !!msgObj.sticky
       });
     }
   })
@@ -397,14 +542,138 @@ const pad = {
 
   // these don't require init; clientVars should all go through here
   getPadId: () => clientVars.padId,
-  getClientIp: () => clientVars.clientIp,
+  // Retained as a plugin-compat shim. The server no longer populates
+  // clientIp on clientVars (value was always '127.0.0.1'; see #6701 /
+  // privacy audit). pad_utils.uniqueId still consumes this as a prefix.
+  getClientIp: () => '127.0.0.1',
   getColorPalette: () => clientVars.colorPalette,
   getPrivilege: (name) => clientVars.accountPrivs[name],
+  canEditPadSettings: () => !!clientVars.canEditPadSettings,
   getUserId: () => pad.myUserInfo.userId,
   getUserName: () => pad.myUserInfo.name,
   userList: () => paduserlist.users(),
+  isPadSettingsEnforcedForMe: () => !!pad.padOptions.enforceSettings && !pad.canEditPadSettings(),
   sendClientMessage: (msg) => {
     pad.collabClient.sendClientMessage(msg);
+  },
+  getEffectivePadOptions: () => {
+    const effectiveOptions = $.extend(true, {}, pad.padOptions);
+    if (pad.isPadSettingsEnforcedForMe()) return normalizeChatOptions(effectiveOptions);
+    const overrides = getMyViewOverrides();
+    for (const key of ['showChat', 'alwaysShowChat', 'chatAndUsers', 'lang']) {
+      if (overrides[key] != null) effectiveOptions[key] = overrides[key];
+    }
+    if (!effectiveOptions.view) effectiveOptions.view = {};
+    for (const [key, value] of Object.entries(overrides.view)) {
+      if (value != null) effectiveOptions.view[key] = value;
+    }
+    return normalizeChatOptions(effectiveOptions);
+  },
+  refreshPadSettingsControls: () => {
+    const padOptions = normalizeChatOptions($.extend(true, {}, pad.padOptions || {}));
+    const view = padOptions.view || {};
+    $('#padsettings-options-disablechat').prop('checked', padOptions.showChat === false);
+    $('#padsettings-options-stickychat').prop('checked', !!padOptions.alwaysShowChat);
+    $('#padsettings-options-chatandusers').prop('checked', !!padOptions.chatAndUsers);
+    $('#padsettings-options-colorscheck').prop('checked', view.showAuthorColors !== false);
+    $('#padsettings-options-fadeauthorcheck')
+        .prop('checked', view.fadeInactiveAuthorColors !== false);
+    $('#padsettings-options-linenoscheck').prop('checked', view.showLineNumbers !== false);
+    $('#padsettings-options-rtlcheck').prop('checked', !!view.rtlIsTrue);
+    $('#padsettings-viewfontmenu').val(view.padFontFamily || '');
+    // When no pad-wide lang is set, reflect the language html10n actually
+    // detected and rendered (e.g. from the browser) instead of defaulting the
+    // dropdown to English while the UI is in another language. See #7925.
+    $('#padsettings-languagemenu').val(padOptions.lang || html10n.getLanguage() || 'en');
+    $('#padsettings-enforcecheck').prop('checked', !!padOptions.enforceSettings);
+    $('#padsettings-options-stickychat, #padsettings-options-chatandusers')
+        .prop('disabled', padOptions.showChat === false);
+    if ($('select').niceSelect) $('select').niceSelect('update');
+  },
+  refreshMyViewControls: () => {
+    const effectiveOptions = pad.getEffectivePadOptions();
+    const disabled = pad.isPadSettingsEnforcedForMe();
+    $('#options-disablechat').prop('checked', effectiveOptions.showChat === false);
+    $('#options-stickychat').prop('checked', !!effectiveOptions.alwaysShowChat);
+    $('#options-chatandusers').prop('checked', !!effectiveOptions.chatAndUsers);
+    $('#options-colorscheck').prop('checked', effectiveOptions.view?.showAuthorColors !== false);
+    $('#options-fadeauthorcheck')
+        .prop('checked', effectiveOptions.view?.fadeInactiveAuthorColors !== false);
+    $('#options-linenoscheck').prop('checked', effectiveOptions.view?.showLineNumbers !== false);
+    $('#options-rtlcheck').prop('checked', !!effectiveOptions.view?.rtlIsTrue);
+    $('#viewfontmenu').val(effectiveOptions.view?.padFontFamily || '');
+    // Fall back to the detected language rather than hardcoded English when the
+    // user has not explicitly chosen one, so the dropdown matches the rendered
+    // UI language. See #7925.
+    $('#languagemenu').val(effectiveOptions.lang || html10n.getLanguage() || 'en');
+    $('#settings input[id^="options-"]').prop('disabled', disabled);
+    $('#viewfontmenu, #languagemenu').prop('disabled', disabled);
+    $('#options-stickychat, #options-chatandusers')
+        .prop('disabled', disabled || effectiveOptions.showChat === false);
+    $('#enforce-settings-notice').prop('hidden', !disabled);
+    if ($('select').niceSelect) $('select').niceSelect('update');
+  },
+  setMyViewOption: (key, value) => {
+    switch (key) {
+      case 'showChat':
+        padcookie.setPref('showChat', value);
+        if (!value) {
+          padcookie.setPref('chatAlwaysVisible', false);
+          padcookie.setPref('chatAndUsers', false);
+        }
+        break;
+      case 'alwaysShowChat':
+        padcookie.setPref('chatAlwaysVisible', value);
+        if (value) padcookie.setPref('showChat', true);
+        break;
+      case 'chatAndUsers':
+        padcookie.setPref('chatAndUsers', value);
+        if (value) padcookie.setPref('chatAlwaysVisible', true);
+        if (value) padcookie.setPref('showChat', true);
+        break;
+      case 'showAuthorColors':
+        padcookie.setPref('showAuthorshipColors', value);
+        break;
+      default:
+        padcookie.setPref(key, value);
+        break;
+    }
+    pad.refreshMyViewControls();
+    pad.applyOptionsChange();
+  },
+  setMyViewLanguage: (lang) => {
+    const cp = (window as any).clientVars?.cookiePrefix || '';
+    Cookies.set(`${cp}language`, lang);
+    pad.refreshMyViewControls();
+    pad.applyOptionsChange();
+  },
+  applyShowChat: (enabled) => {
+    settings.hideChat = !enabled;
+    if (enabled) {
+      if (!window.clientVars.readonly) $('#chaticon').show();
+    } else {
+      $('#users, .sticky-container').removeClass('chatAndUsers popup-show stickyUsers');
+      $('#chatbox').removeClass('chatAndUsersChat stickyChat visible').hide();
+      $('#options-stickychat, #options-chatandusers').prop('checked', false);
+      $('#chaticon').hide();
+    }
+  },
+  applyStickyChat: (enabled) => {
+    const isSticky = $('#chatbox').hasClass('stickyChat');
+    $('#options-stickychat').prop('checked', enabled);
+    if (enabled !== isSticky) chat.stickToScreen(enabled, false);
+    if (!enabled) $('#options-stickychat').prop('disabled', false);
+  },
+  applyChatAndUsers: (enabled) => {
+    const isEnabled = $('#users').hasClass('chatAndUsers');
+    $('#options-chatandusers').prop('checked', enabled);
+    if (enabled !== isEnabled) chat.chatAndUsers(enabled, false);
+    if (!enabled) $('#options-stickychat').prop('disabled', false);
+  },
+  applyLanguage: (lang) => {
+    html10n.localize([lang, 'en']);
+    $('#languagemenu').val(lang);
+    if ($('select').niceSelect) $('select').niceSelect('update');
   },
 
   init() {
@@ -418,6 +687,7 @@ const pad = {
       $('#colorpicker').farbtastic({callback: '#mycolorpickerpreview', width: 220});
       $('#readonlyinput').on('click', () => { padeditbar.setEmbedLinks(); });
       padcookie.init();
+      padMode.init();
       await handshake();
       this._afterHandshake();
     })());
@@ -441,32 +711,42 @@ const pad = {
 
     const postAceInit = () => {
       padeditbar.init();
-      setTimeout(() => {
+      // Skip link (a11y, ether/etherpad#7255): href="#editorcontainer" gives
+      // a working no-JS fallback, but the real focus target is the inner
+      // contenteditable inside two nested iframes — route through ace_focus.
+      $('#skip-to-content').on('click', (e) => {
+        e.preventDefault();
         padeditor.ace.focus();
-      }, 0);
-      const optionsStickyChat = $('#options-stickychat');
-      optionsStickyChat.on('click', () => { chat.stickToScreen(); });
-      // if we have a cookie for always showing chat then show it
-      if (padcookie.getPref('chatAlwaysVisible')) {
-        chat.stickToScreen(true); // stick it to the screen
-        optionsStickyChat.prop('checked', true); // set the checkbox to on
+      });
+      // Auto-focusing the editor on load traps Tab inside the editor iframe
+      // (Tab inserts an indent there, not bubbling out), which makes the
+      // skip link above unreachable via Tab from the URL bar — i.e., the
+      // standard WCAG 2.4.1 entry path. Users now click or Tab into the
+      // editor; the skip link is the first tabbable element.
+      pad.refreshPadSettingsControls();
+      pad.applyOptionsChange();
+      pad.refreshMyViewControls();
+      // The following view overrides MUST run inside postAceInit (after
+      // padeditor.init resolves), not in the synchronous tail of
+      // _afterHandshake. Running them sync queues a setProperty in the
+      // Ace2Editor pending-init queue; the queue is flushed when ace
+      // finishes loading, but padeditor.init's own
+      // setViewOptions(initialViewOptions) call runs immediately *after*
+      // that flush and clobbers the URL-driven value. See #7464 for the
+      // RTL incarnation of this race (now generalised here for #7840).
+      if (settings.rtlIsExplicit) {
+        // URL or server config explicitly set RTL — takes priority over cookie
+        pad.changeViewOption('rtlIsTrue', settings.rtlIsTrue === true);
       }
-      // if we have a cookie for always showing chat then show it
-      if (padcookie.getPref('chatAndUsers')) {
-        chat.chatAndUsers(true); // stick it to the screen
-        $('#options-chatandusers').prop('checked', true); // set the checkbox to on
-      }
-      if (padcookie.getPref('showAuthorshipColors') === false) {
-        pad.changeViewOption('showAuthorColors', false);
-      }
-      if (padcookie.getPref('showLineNumbers') === false) {
+      if (settings.LineNumbersDisabled === true) {
         pad.changeViewOption('showLineNumbers', false);
       }
-      if (padcookie.getPref('rtlIsTrue') === true) {
-        pad.changeViewOption('rtlIsTrue', true);
+      if (settings.noColors === true) {
+        pad.changeViewOption('noColors', true);
       }
-      pad.changeViewOption('padFontFamily', padcookie.getPref('padFontFamily'));
-      $('#viewfontmenu').val(padcookie.getPref('padFontFamily')).niceSelect('update');
+      if (settings.useMonospaceFontGlobal === true) {
+        pad.changeViewOption('padFontFamily', 'RobotoMono');
+      }
 
       // Prevent sticky chat or chat and users to be checked for mobiles
       const checkChatAndUsersVisibility = (x) => {
@@ -480,9 +760,18 @@ const pad = {
       setTimeout(() => { checkChatAndUsersVisibility(mobileMatch); }, 0); // check now after load
 
       $('#editorcontainer').addClass('initialized');
-      if (window.location.hash.toLowerCase() !== '#skinvariantsbuilder' && window.clientVars.enableDarkMode && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+
+      if (window.location.hash.toLowerCase() !== '#skinvariantsbuilder' && window.clientVars.enableDarkMode && (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) && !skinVariants.isWhiteModeEnabledInLocalStorage()) {
         skinVariants.updateSkinVariantsClasses(['super-dark-editor', 'dark-background', 'super-dark-toolbar']);
       }
+      if (window.clientVars.enableDarkMode) {
+        $('#theme-toggle-row').prop('hidden', false);
+        $('#options-darkmode').prop('checked', skinVariants.isDarkMode());
+      }
+
+      showDeletionTokenModalIfPresent();
+      showPrivacyBannerIfEnabled((clientVars as any).privacyBanner);
+      void maybeShowOutdatedNotice();
 
       hooks.aCallAll('postAceInit', {ace: padeditor.ace, clientVars, pad});
     };
@@ -490,7 +779,7 @@ const pad = {
     // order of inits is important here:
     padimpexp.init(this);
     padsavedrevs.init(this);
-    padeditor.init(pad.padOptions.view || {}, this).then(postAceInit);
+    padeditor.init(pad.getEffectivePadOptions().view || {}, this).then(postAceInit);
     paduserlist.init(pad.myUserInfo, this);
     padconnectionstatus.init();
     padmodals.init(this);
@@ -523,6 +812,18 @@ const pad = {
       $('#chaticon').hide();
       $('#options-chatandusers').parent().hide();
       $('#options-stickychat').parent().hide();
+      // The right-side toolbar stays visible on readonly pads. The
+      // server-side `toolbar.menu(buttons, isReadOnly)` (see
+      // src/node/utils/toolbar.ts) already strips `savedrevision`, and
+      // `.readonly .acl-write { display: none }` hides the Import column
+      // inside the import/export popup, so the remaining controls
+      // (export, timeslider, settings, embed, home, showusers) are all
+      // safe for readonly viewers — and the userlist is the surface that
+      // plugins like ep_guest hang their "Log In" button off, so hiding
+      // it traps guests in readonly with no way out. Iframe-embed use
+      // cases that want a clean look (issue #5182) opt in to the hide
+      // via `?showMenuRight=false`, or hide the whole editbar via
+      // `?showControls=false`.
     } else if (!settings.hideChat) { $('#chaticon').show(); }
 
     $('body').addClass(window.clientVars.readonly ? 'readonly' : 'readwrite');
@@ -531,25 +832,6 @@ const pad = {
       ace.ace_setEditable(!window.clientVars.readonly);
     });
 
-    // If the LineNumbersDisabled value is set to true then we need to hide the Line Numbers
-    if (settings.LineNumbersDisabled === true) {
-      this.changeViewOption('showLineNumbers', false);
-    }
-
-    // If the noColors value is set to true then we need to
-    // hide the background colors on the ace spans
-    if (settings.noColors === true) {
-      this.changeViewOption('noColors', true);
-    }
-
-    if (settings.rtlIsTrue === true) {
-      this.changeViewOption('rtlIsTrue', true);
-    }
-
-    // If the Monospacefont value is set to true then change it to monospace.
-    if (settings.useMonospaceFontGlobal === true) {
-      this.changeViewOption('padFontFamily', 'RobotoMono');
-    }
     // if the globalUserName value is set we need to tell the server and
     // the client about the new authorname
     if (settings.globalUserName !== false) {
@@ -580,7 +862,7 @@ const pad = {
   changePadOption: (key, value) => {
     const options = {};
     options[key] = value;
-    pad.handleOptionsChange(options);
+    pad.applyPadSettings(options);
     pad.collabClient.sendClientMessage(
         {
           type: 'padoptions',
@@ -588,26 +870,75 @@ const pad = {
           changedBy: pad.myUserInfo.name || 'unnamed',
         });
   },
-  changeViewOption: (key, value) => {
+  changePadViewOption: (key, value) => {
     const options = {
       view: {},
     };
     options.view[key] = value;
-    pad.handleOptionsChange(options);
+    pad.applyPadSettings(options);
+    pad.collabClient.sendClientMessage(
+        {
+          type: 'padoptions',
+          options,
+          changedBy: pad.myUserInfo.name || 'unnamed',
+        });
+    // The pad creator is never "enforced upon themselves", so their personal
+    // view overrides (cookies) are always merged on top of the pad-wide value
+    // in getEffectivePadOptions. A stale personal pref would therefore mask the
+    // pad-wide value they just set, making the control appear to do nothing
+    // (#7900). Sync the creator's personal pref to the value they chose so
+    // their own view adopts it immediately. They can still override it
+    // afterwards via the "My view" controls.
+    pad.setMyViewOption(key, value);
   },
-  handleOptionsChange: (opts) => {
+  changeViewOption: (key, value) => {
+    const effectiveOptions = pad.getEffectivePadOptions();
+    if (!effectiveOptions.view) effectiveOptions.view = {};
+    effectiveOptions.view[key] = value;
+    padeditor.setViewOptions(effectiveOptions.view);
+  },
+  applyPadSettings: (opts = {}) => {
     // opts object is a full set of options or just
     // some options to change
+    for (const key of ['enforceSettings', 'showChat', 'alwaysShowChat', 'chatAndUsers', 'lang']) {
+      if (opts[key] == null) continue;
+      pad.padOptions[key] = key === 'lang' ? opts[key] : `${opts[key]}` === 'true';
+    }
     if (opts.view) {
       if (!pad.padOptions.view) {
         pad.padOptions.view = {};
       }
       for (const [k, v] of Object.entries(opts.view)) {
         pad.padOptions.view[k] = v;
-        padcookie.setPref(k, v);
       }
-      padeditor.setViewOptions(pad.padOptions.view);
     }
+    // Plugin-namespaced keys (ep_*) are passed through verbatim so plugins
+    // can ride the existing padoptions broadcast/persist rail. Gated on
+    // settings.enablePluginPadOptions (mirrored to clientVars by
+    // getPublicSettings). Server-side normalizePadSettings preserves the
+    // same keys symmetrically.
+    if (clientVars.enablePluginPadOptions) {
+      for (const [k, v] of Object.entries(opts)) {
+        if (/^ep_[a-z0-9_]+$/.test(k)) pad.padOptions[k] = v;
+      }
+    }
+    normalizeChatOptions(pad.padOptions);
+    pad.refreshPadSettingsControls();
+    pad.applyOptionsChange();
+  },
+  applyOptionsChange: () => {
+    const effectiveOptions = pad.getEffectivePadOptions();
+    padeditor.setViewOptions(effectiveOptions.view || {});
+    pad.applyShowChat(effectiveOptions.showChat !== false);
+    if (effectiveOptions.showChat !== false) {
+      if (effectiveOptions.lang) pad.applyLanguage(effectiveOptions.lang);
+      pad.applyChatAndUsers(!!effectiveOptions.chatAndUsers);
+      if (!effectiveOptions.chatAndUsers) pad.applyStickyChat(!!effectiveOptions.alwaysShowChat);
+    }
+    pad.refreshMyViewControls();
+  },
+  handleOptionsChange: (opts) => {
+    pad.applyPadSettings(opts);
   },
   // caller shouldn't mutate the object
   getPadOptions: () => pad.padOptions,
@@ -642,6 +973,14 @@ const pad = {
       const opts = msg.options;
       pad.handleOptionsChange(opts);
     }
+  },
+  showUnacceptedCommitWarning: () => {
+    $.gritter.add({
+      title: html10n.get('pad.gritter.unacceptedCommit.title'),
+      text: html10n.get('pad.gritter.unacceptedCommit.text'),
+      sticky: true,
+      class_name: 'disconnected unsaved-warning',
+    });
   },
   handleChannelStateChange: (newState, message) => {
     const oldFullyConnected = !!padconnectionstatus.isFullyConnected();
@@ -680,6 +1019,7 @@ const pad = {
       padimpexp.disable();
 
       padconnectionstatus.disconnected(message);
+      if (pad.collabClient.hasUnacceptedCommit()) pad.showUnacceptedCommitWarning();
     }
     const newFullyConnected = !!padconnectionstatus.isFullyConnected();
     if (newFullyConnected !== oldFullyConnected) {
@@ -687,39 +1027,19 @@ const pad = {
     }
   },
   handleIsFullyConnected: (isConnected, isInitialConnect) => {
-    pad.determineChatVisibility(isConnected && !isInitialConnect);
-    pad.determineChatAndUsersVisibility(isConnected && !isInitialConnect);
-    pad.determineAuthorshipColorsVisibility();
+    pad.refreshMyViewControls();
     setTimeout(() => {
       padeditbar.toggleDropDown('none');
     }, 1000);
   },
   determineChatVisibility: (asNowConnectedFeedback) => {
-    const chatVisCookie = padcookie.getPref('chatAlwaysVisible');
-    if (chatVisCookie) { // if the cookie is set for chat always visible
-      chat.stickToScreen(true); // stick it to the screen
-      $('#options-stickychat').prop('checked', true); // set the checkbox to on
-    } else {
-      $('#options-stickychat').prop('checked', false); // set the checkbox for off
-    }
+    pad.refreshMyViewControls();
   },
   determineChatAndUsersVisibility: (asNowConnectedFeedback) => {
-    const chatAUVisCookie = padcookie.getPref('chatAndUsersVisible');
-    if (chatAUVisCookie) { // if the cookie is set for chat always visible
-      chat.chatAndUsers(true); // stick it to the screen
-      $('#options-chatandusers').prop('checked', true); // set the checkbox to on
-    } else {
-      $('#options-chatandusers').prop('checked', false); // set the checkbox for off
-    }
+    pad.refreshMyViewControls();
   },
   determineAuthorshipColorsVisibility: () => {
-    const authColCookie = padcookie.getPref('showAuthorshipColors');
-    if (authColCookie) {
-      pad.changeViewOption('showAuthorColors', true);
-      $('#options-colorscheck').prop('checked', true);
-    } else {
-      $('#options-colorscheck').prop('checked', false);
-    }
+    pad.refreshMyViewControls();
   },
   handleCollabAction: (action) => {
     if (action === 'commitPerformed') {
@@ -730,7 +1050,7 @@ const pad = {
   },
   asyncSendDiagnosticInfo: () => {
     const currentUrl = window.location.href;
-    fetch('../ep/pad/connection-diagnostic-info', {
+    fetch(`${exports.baseURL}ep/pad/connection-diagnostic-info`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -775,6 +1095,7 @@ const settings = {
   globalUserName: false,
   globalUserColor: false,
   rtlIsTrue: false,
+  rtlIsExplicit: false,
 };
 
 pad.settings = settings;

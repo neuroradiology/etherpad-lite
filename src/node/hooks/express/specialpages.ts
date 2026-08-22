@@ -7,13 +7,39 @@ const fsp = fs.promises;
 const toolbar = require('../../utils/toolbar');
 const hooks = require('../../../static/js/pluginfw/hooks');
 import settings, {getEpVersion} from '../../utils/Settings';
+import {ensureAuthorTokenCookie} from '../../utils/ensureAuthorTokenCookie';
 import util from 'node:util';
 const webaccess = require('./webaccess');
 const plugins = require('../../../static/js/pluginfw/plugin_defs');
+const i18n = require('../i18n');
+import {renderSocialMeta} from '../../utils/socialMeta';
 
 import {build, buildSync} from 'esbuild'
 import {ArgsExpressType} from "../../types/ArgsExpressType";
+import prometheus from "../../prometheus";
+
 let ioI: { sockets: { sockets: any[]; }; } | null = null
+
+// Shared sanitizer for the `x-proxy-path` header. See the helper for the
+// allowed character class and the protocol-relative / traversal rejection
+// rules. Reused by admin.ts so both call sites share one definition.
+import {sanitizeProxyPath} from '../../utils/sanitizeProxyPath';
+
+// Public routes echo the proxy-path headers into rendered URLs, social-preview
+// metadata, manifest links and the legacy timeslider redirect. Advertise the
+// headers in Vary so a shared cache/CDN in front of Etherpad keys on them and
+// can't serve a proxy-path injected by one client to another (cache poisoning).
+// Mirrors the admin-route fix in admin.ts (GHSA-fjgc-3mj7-8rg8).
+//
+// Only vary on the headers sanitizeProxyPath() actually consults for the
+// current config: x-proxy-path is always honored, but x-forwarded-prefix and
+// x-ingress-path are ignored unless trustProxy is enabled — varying on them
+// then would only fragment shared caches without affecting the response.
+const varyOnProxyPath = (res: any) => {
+  res.vary('x-proxy-path');
+  if (settings.trustProxy) res.vary(['x-forwarded-prefix', 'x-ingress-path']);
+};
+
 
 exports.socketio = (hookName: string, {io}: any) => {
   ioI = io
@@ -35,6 +61,12 @@ exports.expressPreSession = async (hookName:string, {app}:ArgsExpressType) => {
     app.get('/stats', (req:any, res:any) => {
       res.json(require('../../stats').toJSON());
     });
+
+    app.get('/stats/prometheus', async (req, res) => {
+      const metrics = await prometheus()
+      res.setHeader('Content-Type', metrics.contentType)
+      res.send(await metrics.metrics())
+    })
   }
 
 
@@ -70,13 +102,11 @@ exports.expressPreSession = async (hookName:string, {app}:ArgsExpressType) => {
       }
 
 
-      console.log("Favicon is", settings.favicon)
       const fns = [
         ...(settings.favicon ? [path.resolve(settings.root, settings.favicon)] : []),
         settings.skinName && path.join(settings.root, 'src', 'static', 'skins', settings.skinName, 'favicon.ico'),
         path.join(settings.root, 'src', 'static', 'favicon.ico'),
       ].filter(f=>f != null);
-      console.log('FNS are',  fns)
       for (const fn of fns) {
         try {
           await fsp.access(fn, fs.constants.R_OK);
@@ -157,7 +187,13 @@ const handleLiveReload = async (args: ArgsExpressType, padString: string, timeSl
         res.send(output)
       })
       setRouteHandler('/', (req: any, res: any) => {
-        res.send(eejs.require('ep_etherpad-lite/templates/index.html', {req, entrypoint: '/watch/index?hash=' + hash, settings}));
+        const proxyPath = sanitizeProxyPath(req);
+        varyOnProxyPath(res);
+        const socialMetaHtml = renderSocialMeta({
+          req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'home',
+          proxyPath,
+        });
+        res.send(eejs.require('ep_etherpad-lite/templates/index.html', {req, entrypoint: proxyPath + '/watch/index?hash=' + hash, settings, socialMetaHtml, proxyPath}));
       })
     })
 
@@ -172,6 +208,7 @@ const handleLiveReload = async (args: ArgsExpressType, padString: string, timeSl
 
 
       setRouteHandler("/p/:pad", (req: any, res: any, next: Function) => {
+        ensureAuthorTokenCookie(req, res, settings);
         // The below might break for pads being rewritten
         const isReadOnly = !webaccess.userCanModify(req.params.pad, req);
 
@@ -180,12 +217,20 @@ const handleLiveReload = async (args: ArgsExpressType, padString: string, timeSl
           isReadOnly
         });
 
+        const proxyPath = sanitizeProxyPath(req);
+        varyOnProxyPath(res);
+        const socialMetaHtml = renderSocialMeta({
+          req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'pad', padName: req.params.pad,
+          proxyPath,
+        });
         const content = eejs.require('ep_etherpad-lite/templates/pad.html', {
           req,
           toolbar,
           isReadOnly,
-          entrypoint: '/watch/pad?hash=' + hash,
-          settings: settings.getPublicSettings()
+          entrypoint: proxyPath + '/watch/pad?hash=' + hash,
+          settings: settings.getPublicSettings(),
+          socialMetaHtml,
+          proxyPath,
         })
         res.send(content);
       })
@@ -201,7 +246,14 @@ const handleLiveReload = async (args: ArgsExpressType, padString: string, timeSl
       })
 
       setRouteHandler("/p/:pad/timeslider", (req: any, res: any, next: Function) => {
-        console.log("Reloading pad")
+        // Direct visits (legacy bookmarks) get redirected back to the pad,
+        // where the in-pad PadModeController handles entering history mode.
+        // The iframe used by history mode requests this URL with ?embed=1
+        // and gets the full timeslider HTML rendered for embedded use.
+        if (req.query.embed !== '1') {
+          return res.redirect(302, `../${encodeURIComponent(req.params.pad)}`);
+        }
+        ensureAuthorTokenCookie(req, res, settings);
         // The below might break for pads being rewritten
         const isReadOnly = !webaccess.userCanModify(req.params.pad, req);
 
@@ -210,12 +262,21 @@ const handleLiveReload = async (args: ArgsExpressType, padString: string, timeSl
           isReadOnly
         });
 
+        const proxyPath = sanitizeProxyPath(req);
+        varyOnProxyPath(res);
+        const socialMetaHtml = renderSocialMeta({
+          req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'timeslider', padName: req.params.pad,
+          proxyPath,
+        });
         const content = eejs.require('ep_etherpad-lite/templates/timeslider.html', {
           req,
           toolbar,
           isReadOnly,
-          entrypoint: '/watch/timeslider?hash=' + hash,
-          settings: settings.getPublicSettings()
+          embed: true,
+          entrypoint: proxyPath + '/watch/timeslider?hash=' + hash,
+          settings: settings.getPublicSettings(),
+          socialMetaHtml,
+          proxyPath,
         })
         res.send(content);
       })
@@ -271,6 +332,7 @@ exports.expressCreateServer = async (_hookName: string, args: ArgsExpressType, c
   })
 
   const indexString = eejs.require('ep_etherpad-lite/templates/indexBootstrap.js', {
+    settings,
   })
 
   const timeSliderString = eejs.require('ep_etherpad-lite/templates/timeSliderBootstrap.js', {
@@ -324,12 +386,19 @@ exports.expressCreateServer = async (_hookName: string, args: ArgsExpressType, c
 
     // serve index.html under /
     args.app.get('/', (req: any, res: any) => {
-      res.send(eejs.require('ep_etherpad-lite/templates/index.html', {req, settings, entrypoint: "./"+fileNameIndex}));
+      const proxyPath = sanitizeProxyPath(req);
+      varyOnProxyPath(res);
+      const socialMetaHtml = renderSocialMeta({
+        req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'home',
+        proxyPath,
+      });
+      res.send(eejs.require('ep_etherpad-lite/templates/index.html', {req, settings, entrypoint: "./"+fileNameIndex, socialMetaHtml, proxyPath}));
     });
 
 
     // serve pad.html under /p
     args.app.get('/p/:pad', (req: any, res: any, next: Function) => {
+      ensureAuthorTokenCookie(req, res, settings);
       // The below might break for pads being rewritten
       const isReadOnly = !webaccess.userCanModify(req.params.pad, req);
 
@@ -338,27 +407,58 @@ exports.expressCreateServer = async (_hookName: string, args: ArgsExpressType, c
         isReadOnly
       });
 
+      const proxyPath = sanitizeProxyPath(req);
+      varyOnProxyPath(res);
+      const socialMetaHtml = renderSocialMeta({
+        req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'pad', padName: req.params.pad,
+        proxyPath,
+      });
       const content = eejs.require('ep_etherpad-lite/templates/pad.html', {
         req,
         toolbar,
         isReadOnly,
         entrypoint: "../"+fileNamePad,
-        settings: settings.getPublicSettings()
+        settings: settings.getPublicSettings(),
+        socialMetaHtml,
+        proxyPath,
       })
       res.send(content);
     });
 
     // serve timeslider.html under /p/$padname/timeslider
     args.app.get('/p/:pad/timeslider', (req: any, res: any, next: Function) => {
+      // Direct visits (legacy bookmarks) get redirected back to the pad,
+      // where the in-pad PadModeController handles entering history mode.
+      // The iframe used by history mode requests this URL with ?embed=1
+      // and gets the full timeslider HTML rendered for embedded use.
+      if (req.query.embed !== '1') {
+        // Absolute path (not relative `../`) so Firefox and Chrome resolve
+        // it identically — relative redirects from /p/:pad/timeslider are
+        // technically well-defined but Firefox dropped a trailing-slash
+        // case once that flaked the legacy-URL test (#7710).
+        const proxyPath = sanitizeProxyPath(req);
+        varyOnProxyPath(res);
+        return res.redirect(302, `${proxyPath}/p/${encodeURIComponent(req.params.pad)}`);
+      }
+      ensureAuthorTokenCookie(req, res, settings);
       hooks.callAll('padInitToolbar', {
         toolbar,
       });
 
+      const proxyPath = sanitizeProxyPath(req);
+      varyOnProxyPath(res);
+      const socialMetaHtml = renderSocialMeta({
+        req, settings, availableLangs: i18n.availableLangs, locales: i18n.locales, kind: 'timeslider', padName: req.params.pad,
+        proxyPath,
+      });
       res.send(eejs.require('ep_etherpad-lite/templates/timeslider.html', {
         req,
         toolbar,
+        embed: true,
         entrypoint: "../../"+fileNameTimeSlider,
-        settings: settings.getPublicSettings()
+        settings: settings.getPublicSettings(),
+        socialMetaHtml,
+        proxyPath,
       }));
     });
   } else {

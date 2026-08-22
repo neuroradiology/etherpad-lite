@@ -35,8 +35,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {argv} from './Cli'
-import jsonminify from 'jsonminify';
+import {parse as parseJsonc, printParseErrorCode, ParseError} from 'jsonc-parser';
 import log4js from 'log4js';
+import {createHash} from 'node:crypto';
 import randomString from './randomstring';
 const suppressDisableMsg = ' -- To suppress these warning messages change ' +
     'suppressErrorsInPadText to true in your settings.json\n';
@@ -115,9 +116,18 @@ const parseSettings = (settingsFilename: string, isSettings: boolean) => {
   }
 
   try {
-    settingsStr = jsonminify(settingsStr).replace(',]', ']').replace(',}', '}');
+    // jsonc-parser tolerates comments and trailing commas, so settings files
+    // can stay annotated. Unlike the old jsonminify + naive ',]'/',}' string
+    // replace, it fixes *every* trailing comma (not just the first of each
+    // kind) and never mangles those sequences when they appear inside strings.
+    const errors: ParseError[] = [];
+    const settings = parseJsonc(settingsStr, errors, {allowTrailingComma: true});
 
-    const settings = JSON.parse(settingsStr);
+    if (errors.length > 0) {
+      const {error, offset} = errors[0];
+      throw new Error(`${printParseErrorCode(error)} at offset ${offset}`);
+    }
+    if (settings === undefined) throw new Error('file is empty or not valid JSON');
 
     logger.info(`${settingsType} loaded from: ${settingsFilename}`);
 
@@ -135,7 +145,7 @@ const parseSettings = (settingsFilename: string, isSettings: boolean) => {
 export const getGitCommit = () => {
   let version = '';
   try {
-    let rootPath = settings.root;
+    let rootPath = absolutePaths.findEtherpadRoot();
     if (fs.lstatSync(`${rootPath}/.git`).isFile()) {
       rootPath = fs.readFileSync(`${rootPath}/.git`, 'utf8');
       rootPath = rootPath.split(' ').pop()?.trim() ?? '';
@@ -161,7 +171,18 @@ export type SettingsType = {
   settingsFilename: string,
   credentialsFilename: string,
   title: string,
+  showRecentPads: boolean,
   favicon: string | null,
+  publicURL: string | null,
+  socialMeta: {
+    // Runtime type is wider than what an operator writes by hand: when
+    // `socialMeta.description` is sourced from an env var (e.g.
+    // `"${SOCIAL_META_DESCRIPTION:null}"` in settings.json.docker), the
+    // settings loader's `coerceValue()` turns numeric-looking strings into
+    // numbers and "true"/"false" into booleans. Downstream code stringifies
+    // before use; the wider type stops callers (and tests) needing casts.
+    description: string | number | boolean | null,
+  },
   ttl: {
     AccessToken: number,
     AuthorizationCode: number,
@@ -171,6 +192,20 @@ export type SettingsType = {
   },
   updateServer: string,
   enableDarkMode: boolean,
+  enablePadWideSettings: boolean,
+  enablePluginPadOptions: boolean,
+  allowPadDeletionByAllUsers: boolean,
+  privacyBanner: {
+    enabled: boolean,
+    title: string,
+    body: string,
+    learnMoreUrl: string | null,
+    dismissal: 'dismissible' | 'sticky',
+  },
+  privacy: {
+    updateCheck: boolean,
+    pluginCatalog: boolean,
+  },
   skinName: string | null,
   skinVariants: string,
   ip: string,
@@ -201,6 +236,8 @@ export type SettingsType = {
     alwaysShowChat: boolean,
     chatAndUsers: boolean,
     lang: string | null,
+    fadeInactiveAuthorColors: boolean,
+    enforceReadableAuthorColors: boolean,
   },
   enableMetrics: boolean,
   padShortcutEnabled: {
@@ -222,6 +259,8 @@ export type SettingsType = {
     cmdShiftN: boolean,
     cmdShift1: boolean,
     cmdShiftC: boolean,
+    cmdShiftD: boolean,
+    cmdShiftK: boolean,
     cmdH: boolean,
     ctrlHome: boolean,
     pageUp: boolean,
@@ -236,14 +275,16 @@ export type SettingsType = {
   editOnly: boolean,
   maxAge: number,
   minify: boolean,
-  abiword: string | null,
   soffice: string | null,
+  docxExport: boolean,
   allowUnknownFileEnds: boolean,
   loglevel: string,
   logLayoutType: string,
-  disableIPlogging: boolean,
+  disableIPlogging: boolean,            // deprecated — see ipLogging
+  ipLogging: 'full' | 'truncated' | 'anonymous',
   automaticReconnectionTimeout: number,
   loadTest: boolean,
+  scalingDiveMetrics: boolean,
   dumpOnUncleanExit: boolean,
   indentationOnNewLine: boolean,
   logconfig: any | null,
@@ -251,8 +292,10 @@ export type SettingsType = {
   trustProxy: boolean,
   cookie: {
     keyRotationInterval: number,
+    prefix: string,
     sameSite: boolean | "lax" | "strict" | "none" | undefined,
     sessionLifetime: number,
+    sessionCleanup: boolean,
     sessionRefreshInterval: number,
   },
   requireAuthentication: boolean,
@@ -261,11 +304,18 @@ export type SettingsType = {
   sso: {
     issuer: string,
     clients?: {client_id: string}[]
+    // Optional operator-supplied signing keys for the embedded OIDC provider's
+    // cookies. When unset, a secret key is derived from the session secret.
+    // Provide an ordered array `[newKey, ...oldKeys]` to rotate.
+    cookieKeys?: string[]
   },
   showSettingsInAdminPage: boolean,
   cleanup: {
     enabled: boolean,
     keepRevisions: number,
+  },
+  gdprAuthorErasure: {
+    enabled: boolean,
   },
   scrollWhenFocusLineIsOutOfViewport: {
     percentage: {
@@ -291,7 +341,48 @@ export type SettingsType = {
   lowerCasePadIds: boolean,
   randomVersionString: string,
   gitVersion: string
-  getPublicSettings: () => Pick<SettingsType, "title" | "skinVariants"|"randomVersionString"|"skinName"|"toolbar"| "exposeVersion"| "gitVersion">,
+  updates: {
+    tier: 'off' | 'notify' | 'manual' | 'auto' | 'autonomous',
+    source: 'github',
+    channel: 'stable',
+    installMethod: 'auto' | 'git' | 'docker' | 'npm' | 'managed',
+    checkIntervalHours: number,
+    githubRepo: string,
+    requireAdminForStatus: boolean,
+    /** Tier 2+ knobs. Default 0 in PR 2; tier 3 makes preApplyGraceMinutes meaningful. */
+    preApplyGraceMinutes: number,
+    drainSeconds: number,
+    rollbackHealthCheckSeconds: number,
+    diskSpaceMinMB: number,
+    /** When true, refuse updates whose tag is not signed by a trusted key. */
+    requireSignature: boolean,
+    /** Override the OS keyring location (passed to git verify-tag via $GNUPGHOME). */
+    trustedKeysPath: string | null,
+    /**
+     * Tier 4: nightly window during which the scheduler is allowed to fire.
+     * Null = tier 4 disabled (canAutonomous is denied with reason
+     * `maintenance-window-missing`). Shape validated at boot by `parseWindow`.
+     */
+    maintenanceWindow: {start: string; end: string; tz: 'local' | 'utc'} | null,
+  },
+  adminOpenAPI: {
+    enabled: boolean,
+  },
+  adminEmail: string | null,
+  /**
+   * SMTP transport for outbound admin notifications (updater + future
+   * features). Null `host` disables outbound mail — the Notifier still runs
+   * and dedupe state is updated, but messages only log `(would send email)`.
+   * `auth` is optional; omit for unauthenticated relays.
+   */
+  mail: {
+    host: string | null;
+    port: number;
+    secure: boolean;
+    from: string | null;
+    auth: {user: string; pass: string} | null;
+  },
+  getPublicSettings: () => Pick<SettingsType, "title" | "skinVariants"|"randomVersionString"|"skinName"|"toolbar"| "exposeVersion"| "gitVersion" | "enableDarkMode" | "enablePadWideSettings" | "enablePluginPadOptions" | "privacyBanner">,
 }
 
 const settings: SettingsType = {
@@ -303,6 +394,12 @@ const settings: SettingsType = {
    * The app title, visible e.g. in the browser window
    */
   title: 'Etherpad',
+
+  /**
+   * Whether to show recent pads on the homepage
+   */
+  showRecentPads: true,
+
   /**
    * Pathname of the favicon you want to use. If null, the skin's favicon is
    * used if one is provided by the skin, otherwise the default Etherpad favicon
@@ -310,6 +407,36 @@ const settings: SettingsType = {
    * Etherpad root directory.
    */
   favicon: null,
+
+  /**
+   * Canonical public origin of this Etherpad instance, e.g. "https://pad.example.com".
+   * When set, it is used to build absolute URLs in server-rendered output (currently
+   * the Open Graph / Twitter Card meta tags). When null, those URLs fall back to the
+   * incoming request's protocol+host, which is safe when Host/X-Forwarded-Host
+   * headers are trusted but should be configured explicitly in production to avoid
+   * client-controlled origin values appearing in og:url / og:image.
+   *
+   * No trailing slash. Must include scheme.
+   */
+  publicURL: null,
+
+  /**
+   * Open Graph / Twitter Card metadata, served on the homepage, pad pages and
+   * timeslider for nicer previews when a pad URL is shared in chat apps.
+   *
+   * description: when non-null, this exact string is used as og:description /
+   *   twitter:description regardless of the visitor's negotiated language. Most
+   *   crawlers (WhatsApp, Signal, Telegram, Slack, Facebook) don't send an
+   *   Accept-Language header, so without an override they always see the
+   *   English fallback — set this if your instance serves a non-English
+   *   audience and you want a fixed blurb. Leave null to use Etherpad's
+   *   built-in i18n catalog (key `pad.social.description`), which honours the
+   *   visitor's Accept-Language and can be overridden per-language via the
+   *   standard `customLocaleStrings` mechanism below.
+   */
+  socialMeta: {
+    description: null,
+  },
   ttl: {
     AccessToken: 1 * 60 * 60, // 1 hour in seconds
     AuthorizationCode: 10 * 60, // 10 minutes in seconds
@@ -319,6 +446,29 @@ const settings: SettingsType = {
   },
   updateServer: "https://static.etherpad.org",
   enableDarkMode: true,
+  enablePadWideSettings: true,
+  // Lets plugins (e.g. ep_plugin_helpers' padToggle / padSelect) ride the
+  // existing padoptions broadcast/persist rail to store pad-wide options
+  // under ep_* keys. Operators who want to lock plugin-driven pad-wide
+  // state out can set this to false in settings.json.
+  enablePluginPadOptions: true,
+  allowPadDeletionByAllUsers: false,
+  privacyBanner: {
+    enabled: false,
+    title: 'Privacy notice',
+    body: 'This instance processes pad content on our servers. ' +
+        'See the linked policy for retention and how to request erasure.',
+    learnMoreUrl: null,
+    dismissal: 'dismissible',
+  },
+  privacy: {
+    // Outbound calls. See PRIVACY.md.
+    // Set to false to disable hourly version check (UpdateCheck.ts).
+    updateCheck: true,
+    // Set to false to disable plugin-catalog fetch from updateServer
+    // (installer.ts). Manual install via CLI still works.
+    pluginCatalog: true,
+  },
   /*
  * Skin name.
  *
@@ -357,7 +507,7 @@ const settings: SettingsType = {
      * properly, but increasing the value increases susceptibility to denial of service attacks
      * (malicious clients can exhaust memory).
      */
-    maxHttpBufferSize: 50000,
+    maxHttpBufferSize: 1000000,
   },
   /*
   The authentication method used by the server.
@@ -382,7 +532,7 @@ const settings: SettingsType = {
     'This pad text is synchronized as you type, so that everyone viewing this page sees the same ' +
     'text. This allows you to collaborate seamlessly on documents!',
     '',
-    'Etherpad on Github: https://github.com/ether/etherpad-lite',
+    'Etherpad on Github: https://github.com/ether/etherpad',
   ].join('\n'),
   /**
    * The default Pad Settings for a user (Can be overridden by changing the setting
@@ -399,11 +549,70 @@ const settings: SettingsType = {
     alwaysShowChat: false,
     chatAndUsers: false,
     lang: null,
+    fadeInactiveAuthorColors: true,
+    enforceReadableAuthorColors: true,
   },
   /**
    * Wether to enable the /stats endpoint. The functionality in the admin menu is untouched for this.
    */
   enableMetrics: true,
+  /**
+   * Self-update subsystem (PR 1: tier 1 only).
+   * Tier "off" disables the version check entirely. Default "notify" shows a banner when behind.
+   */
+  updates: {
+    tier: 'notify',
+    source: 'github',
+    channel: 'stable',
+    installMethod: 'auto',
+    checkIntervalHours: 6,
+    githubRepo: 'ether/etherpad',
+    // The /admin/update/status endpoint returns full info including currentVersion.
+    // Default false matches existing behavior: the version is already exposed via /health.
+    // Set true to require an authenticated admin session for the endpoint without
+    // disabling the updater itself.
+    requireAdminForStatus: false,
+    // Tier 2+ knobs. Only meaningful at tier "manual" or higher.
+    preApplyGraceMinutes: 0,
+    drainSeconds: 60,
+    rollbackHealthCheckSeconds: 60,
+    diskSpaceMinMB: 500,
+    requireSignature: false,
+    trustedKeysPath: null,
+    // Tier 4: night-window during which the scheduler may fire. Null disables tier 4 only.
+    // Example: { start: "03:00", end: "05:00", tz: "local" } or tz: "utc".
+    maintenanceWindow: null,
+  },
+  /**
+   * Admin OpenAPI document endpoint at /admin/openapi.json.
+   *
+   * Disabled by default per Etherpad's "new features behind a flag, off by
+   * default" policy (see CONTRIBUTING.md). The codegen pipeline imports
+   * generateAdminDefinition() in-process and does not depend on the route;
+   * enable this only if you want third-party tooling (Postman, swagger-ui,
+   * downstream clients) to consume the spec at runtime.
+   */
+  adminOpenAPI: {
+    enabled: false,
+  },
+  /**
+   * Contact address for admin notifications (updates, future security advisories).
+   * Null disables outbound mail from the updater.
+   */
+  adminEmail: null,
+  /**
+   * SMTP transport for outbound admin notifications. Null `host` keeps the
+   * legacy log-only behaviour. Set `host`+`from` (and optionally `auth`) to
+   * deliver via nodemailer. The dependency is lazy-loaded — installs without
+   * a mail.host pay no runtime cost.
+   */
+  mail: {
+    host: null,
+    port: 587,
+    secure: false,
+    from: null,
+    auth: null,
+  },
   /**
    * Whether certain shortcut keys are enabled for a user in the pad
    */
@@ -426,6 +635,8 @@ const settings: SettingsType = {
     cmdShiftN: true,
     cmdShift1: true,
     cmdShiftC: true,
+    cmdShiftD: true, // duplicate current line(s) — issue #6433
+    cmdShiftK: true, // delete current line(s) — issue #6433
     cmdH: true,
     ctrlHome: true,
     pageUp: true,
@@ -467,13 +678,14 @@ const settings: SettingsType = {
    */
   minify: true,
   /**
-   * The path of the abiword executable
-   */
-  abiword: null,
-  /**
    * The path of the libreoffice executable
    */
   soffice: null,
+  /**
+   * When true, the "Microsoft Word" export button downloads a .docx file (requires soffice).
+   * Set to false to revert to legacy .doc output.
+   */
+  docxExport: true,
   /**
    * Should we support none natively supported file types on import?
    */
@@ -490,6 +702,7 @@ const settings: SettingsType = {
    * Disable IP logging
    */
   disableIPlogging: false,
+  ipLogging: 'anonymous',
   /**
    * Number of seconds to automatically reconnect pad
    */
@@ -498,6 +711,13 @@ const settings: SettingsType = {
    * Disable Load Testing
    */
   loadTest: false,
+  /**
+   * Expose extra Prometheus metrics designed for the scaling-dive load-test harness
+   * (ether/etherpad#7756): etherpad_pad_users{padId}, etherpad_changeset_apply_duration_seconds,
+   * etherpad_socket_emits_total{type}. Default false — enable only when running the harness so
+   * production deployments aren't paying for instrumentation they don't use.
+   */
+  scalingDiveMetrics: false,
   /**
    * Disable dump of objects preventing a clean exit
    */
@@ -514,17 +734,29 @@ const settings: SettingsType = {
  * Deprecated cookie signing key.
  */
   sessionKey: null,
-  /*
- * Trust Proxy, whether or not trust the x-forwarded-for header.
- */
+  /**
+   * Trust Proxy, whether or not trust the x-forwarded-for header.
+   *
+   * Setting this to `true` also makes Etherpad honor two standard URL-path-
+   * prefix headers from upstream proxies:
+   *   - `X-Forwarded-Prefix` (HAProxy / Traefik convention)
+   *   - `X-Ingress-Path` (Home Assistant supervisor ingress)
+   *
+   * Both are sanitised before use (see src/node/utils/sanitizeProxyPath.ts).
+   * Etherpad's own `x-proxy-path` header is honored regardless of this
+   * setting; the operator is presumed to have configured their proxy
+   * intentionally when sending the custom header.
+   */
   trustProxy: false,
   /*
  * Settings controlling the session cookie issued by Etherpad.
  */
   cookie: {
     keyRotationInterval: 1 * 24 * 60 * 60 * 1000,
+    prefix: '',
     sameSite: 'lax',
     sessionLifetime: 10 * 24 * 60 * 60 * 1000,
+    sessionCleanup: true,
     sessionRefreshInterval: 1 * 24 * 60 * 60 * 1000,
   },
   /*
@@ -551,6 +783,13 @@ const settings: SettingsType = {
   cleanup: {
     enabled: false,
     keepRevisions: 100,
+  },
+  /*
+   * GDPR Art. 17 author erasure REST endpoint (anonymizeAuthor).
+   * Disabled by default; operators must opt in.
+   */
+  gdprAuthorErasure: {
+    enabled: false,
   },
   /*
  * By default, when caret is moved out of viewport, it scrolls the minimum
@@ -645,27 +884,52 @@ const settings: SettingsType = {
       title: settings.title,
       skinName: settings.skinName,
       skinVariants: settings.skinVariants,
+      // Needed so pad.html / timeslider.html only emit the dark theme-color
+      // variant when dark mode can actually be reached client-side (#7606).
+      enableDarkMode: settings.enableDarkMode,
+      enablePadWideSettings: settings.enablePadWideSettings,
+      enablePluginPadOptions: settings.enablePluginPadOptions,
+      privacyBanner: getPublicPrivacyBanner(),
     }
   },
   gitVersion: getGitCommit(),
 }
 
+// Build the wire-shape of `privacyBanner` for clientVars / getPublicSettings().
+// The settings file is operator-controlled and `_.defaults()` (used by
+// storeSettings) preserves unknown nested keys at runtime. Returning a literal
+// instead of `settings.privacyBanner` itself stops a typo or copy-paste from
+// shipping arbitrary extra keys to every browser.
+export const getPublicPrivacyBanner = () => ({
+  enabled: settings.privacyBanner.enabled,
+  title: settings.privacyBanner.title,
+  body: settings.privacyBanner.body,
+  learnMoreUrl: settings.privacyBanner.learnMoreUrl,
+  dismissal: settings.privacyBanner.dismissal,
+});
+
 export default settings;
+// CJS compatibility: plugins use require('ep_etherpad-lite/node/utils/Settings')
+// and expect settings properties directly on the module object, not under .default
+if (typeof module !== 'undefined' && module.exports) {
+  const currentExports = module.exports;
+  for (const key of Object.keys(settings)) {
+    if (!(key in currentExports)) {
+      Object.defineProperty(currentExports, key, {
+        get: () => (settings as any)[key],
+        set: (v: any) => { (settings as any)[key] = v; },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+  }
+}
 
 /**
  * This setting is passed with dbType to ueberDB to set up the database
  */
 settings.dbSettings =  {filename: path.join(settings.root, 'var/rusty.db')};
 // END OF SETTINGS
-
-// checks if abiword is avaiable
-export const abiwordAvailable = () => {
-    if (settings.abiword != null) {
-        return os.type().indexOf('Windows') !== -1 ? 'withoutPDF' : 'yes';
-    } else {
-        return 'no';
-    }
-};
 
 export const sofficeAvailable = () => {
     if (settings.soffice != null) {
@@ -675,19 +939,7 @@ export const sofficeAvailable = () => {
     }
 };
 
-export const exportAvailable = () => {
-    const abiword = abiwordAvailable();
-    const soffice = sofficeAvailable();
-
-    if (abiword === 'no' && soffice === 'no') {
-        return 'no';
-    } else if ((abiword === 'withoutPDF' && soffice === 'no') ||
-        (abiword === 'no' && soffice === 'withoutPDF')) {
-        return 'withoutPDF';
-    } else {
-        return 'yes';
-    }
-};
+export const exportAvailable = () => sofficeAvailable();
 
 
 // Return etherpad version from package.json
@@ -741,7 +993,7 @@ const storeSettings = (settingsObj: any) => {
  * no coercition for "null" values.
  *
  * If the user wants a variable to be null by default, he'll have to use the
- * short syntax "${ABIWORD}", and not "${ABIWORD:null}": the latter would result
+ * short syntax "${SOFFICE}", and not "${SOFFICE:null}": the latter would result
  * in the literal string "null", instead.
  */
 const coerceValue = (stringValue: string) => {
@@ -936,6 +1188,75 @@ export const reloadSettings = () => {
     storeSettings(settingsParsed);
     storeSettings(credentials);
 
+    // Emit a clear migration warning when the deprecated abiword setting is detected.
+    if (settingsParsed && (settingsParsed as any).abiword != null) {
+        logger.warn(
+            'The "abiword" setting is no longer supported and has been ignored. ' +
+            'Abiword import/export support has been removed. ' +
+            'Please install LibreOffice and set "soffice" to its executable path instead.'
+        );
+    }
+
+    // Deprecation shim: if the operator set the legacy boolean `disableIPlogging`
+    // without also setting the new tri-state `ipLogging`, map the boolean over
+    // once and emit a WARN. An explicitly-set `ipLogging` always wins.
+    if (settingsParsed != null && 'disableIPlogging' in (settingsParsed as any) &&
+        !('ipLogging' in (settingsParsed as any))) {
+      logger.warn(
+          '`disableIPlogging` is deprecated; use `ipLogging: "anonymous"` ' +
+          '(or "truncated" / "full") instead.');
+      settings.ipLogging = (settingsParsed as any).disableIPlogging ? 'anonymous' : 'full';
+    }
+
+    // Validate `ipLogging`. anonymizeIp() would otherwise silently treat an
+    // unknown value as "truncated" and ship partially-redacted IPs.
+    const validIpLogging = ['full', 'truncated', 'anonymous'];
+    if (!validIpLogging.includes(settings.ipLogging as any)) {
+      logger.warn(
+          `ipLogging="${settings.ipLogging}" is not one of ` +
+          `${validIpLogging.join(', ')}; falling back to "anonymous".`);
+      settings.ipLogging = 'anonymous';
+    }
+
+    // Validate `privacyBanner.dismissal`. The client treats every value other
+    // than the exact strings 'dismissible' and 'sticky' as "no special
+    // handling", which silently degrades a misconfigured 'sticky' to a
+    // dismissible-shaped notice (and vice versa). Coerce to the safer default
+    // and warn so the operator sees the typo.
+    const validDismissal = ['dismissible', 'sticky'];
+    if (settings.privacyBanner != null
+        && !validDismissal.includes(settings.privacyBanner.dismissal as any)) {
+      logger.warn(
+          `privacyBanner.dismissal="${settings.privacyBanner.dismissal}" is ` +
+          `not one of ${validDismissal.join(', ')}; falling back to ` +
+          `"dismissible".`);
+      settings.privacyBanner.dismissal = 'dismissible';
+    }
+
+    // Settings.json files generated before December 2021 used `false` as the
+    // default for these string options. The client treats the boolean `false`
+    // as a sentinel meaning "no enforced value", but the dispatch in
+    // pad.ts:getParams() coerces the boolean to the string "false" before
+    // applying it, which then propagates as the user's name and color and
+    // triggers `malformed color: false` on the server (#7686). Normalize
+    // legacy booleans to null at the boundary so downstream code sees the
+    // expected sentinel. Guard against a malformed padOptions (null, array,
+    // primitive) — storeSettings() will overwrite it raw if settings.json
+    // declares it as anything other than a plain object.
+    if (settings.padOptions != null
+        && typeof settings.padOptions === 'object'
+        && !Array.isArray(settings.padOptions)) {
+      for (const key of ['userName', 'userColor'] as const) {
+        if ((settings.padOptions as any)[key] === false) {
+          logger.warn(
+              `padOptions.${key}=false is a legacy default (pre-2021) and is ` +
+              `now treated as null. Update settings.json to use null instead ` +
+              `to silence this warning.`);
+          (settings.padOptions as any)[key] = null;
+        }
+      }
+    }
+
     // Init logging config
     settings.logconfig = defaultLogConfig(
       settings.loglevel ? settings.loglevel : defaultLogLevel,
@@ -944,6 +1265,13 @@ export const reloadSettings = () => {
     logger.warn("loglevel: " + settings.loglevel);
     logger.warn("logLayoutType: " + settings.logLayoutType);
     initLogging(settings.logconfig);
+
+    if (settings.loadTest) {
+      logger.warn(
+        'settings.loadTest is true: SecurityManager.checkAccess() will bypass ' +
+        'authentication and authorization for both HTTP and socket.io requests. ' +
+        'Do NOT enable this in production.');
+    }
 
     if (!settings.skinName) {
         logger.warn('No "skinName" parameter found. Please check out settings.json.template and ' +
@@ -989,20 +1317,6 @@ export const reloadSettings = () => {
         logger.info(`Using skin "${settings.skinName}" in dir: ${skinPath}`);
     }
 
-    if (settings.abiword) {
-        // Check abiword actually exists
-      fs.exists(settings.abiword, (exists: boolean) => {
-        if (!exists) {
-          const abiwordError = 'Abiword does not exist at this path, check your settings file.';
-          if (!settings.suppressErrorsInPadText) {
-            settings.defaultPadText += `\nError: ${abiwordError}${suppressDisableMsg}`;
-          }
-          logger.error(`${abiwordError} File location: ${settings.abiword}`);
-          settings.abiword = null;
-        }
-      });
-    }
-
     if (settings.soffice) {
         fs.exists(settings.soffice, (exists: boolean) => {
             if (!exists) {
@@ -1043,6 +1357,48 @@ export const reloadSettings = () => {
             'use automatic key rotation instead (see the cookie.keyRotationInterval setting).');
     }
 
+    // Validate cookie prefix to prevent header injection via cookie names
+    if (settings.cookie.prefix && !/^[a-zA-Z0-9_-]*$/.test(settings.cookie.prefix)) {
+      logger.error(`cookie.prefix "${settings.cookie.prefix}" contains invalid characters. ` +
+          'Only alphanumeric characters, hyphens, and underscores are allowed. Using empty prefix.');
+      settings.cookie.prefix = '';
+    }
+
+    // Warn when an account still uses a placeholder/example password from the
+    // shipped config; these should be changed before the instance is exposed.
+    // Logged loudly (error level in production) rather than throwing, so test
+    // fixtures and existing setups that use placeholder credentials still run.
+    {
+      const weakPasswords = new Set(['changeme1', 'changeme', 'admin', 'password', '']);
+      const users = (settings.users || {}) as Record<string, {password?: string, is_admin?: boolean}>;
+      const offenders = Object.keys(users).filter((name) =>
+        users[name] && typeof users[name].password === 'string' &&
+        weakPasswords.has(users[name].password as string));
+      if (offenders.length) {
+        const msg = `Account(s) using a default/placeholder password: ${offenders.join(', ')}. ` +
+            'Set a strong password (or use the ep_hash_auth plugin) before exposing this instance.';
+        if (process.env.NODE_ENV === 'production') logger.error(msg);
+        else logger.warn(msg);
+      }
+
+      // Same check for OIDC client secrets when SSO is configured: the shipped
+      // templates fall back to placeholder values if ADMIN_SECRET / USER_SECRET
+      // are not provided.
+      const sso = (settings as any).sso;
+      const ssoClients: Array<{client_id?: string, client_secret?: string}> =
+        (sso && Array.isArray(sso.clients)) ? sso.clients : [];
+      const weakSecrets = new Set(['admin', 'user', 'secret', 'changeme', '']);
+      const secretOffenders = ssoClients
+        .filter((c) => c && typeof c.client_secret === 'string' && weakSecrets.has(c.client_secret))
+        .map((c) => c.client_id || '(unnamed client)');
+      if (secretOffenders.length) {
+        const msg = `SSO client(s) using a default/placeholder client_secret: ${secretOffenders.join(', ')}. ` +
+            'Set a strong secret (e.g. via the ADMIN_SECRET / USER_SECRET env vars) before enabling SSO in production.';
+        if (process.env.NODE_ENV === 'production') logger.error(msg);
+        else logger.warn(msg);
+      }
+    }
+
     if (settings.dbType === 'dirty') {
         const dirtyWarning = 'DirtyDB is used. This is not recommended for production.';
         if (!settings.suppressErrorsInPadText) {
@@ -1066,18 +1422,38 @@ export const reloadSettings = () => {
     }
 
     /*
-     * At each start, Etherpad generates a random string and appends it as query
-     * parameter to the URLs of the static assets, in order to force their reload.
-     * Subsequent requests will be cached, as long as the server is not reloaded.
+     * Etherpad appends this token as a ?v= query parameter on static assets
+     * and as the content seed for the padbootstrap-<hash>.min.js bundles, so
+     * clients invalidate their cache when a release goes out.
      *
-     * For the rationale behind this choice, see
-     * https://github.com/ether/etherpad-lite/pull/3958
+     * Historically this was `randomString(4)`, regenerated on every boot. That
+     * broke horizontally-scaled deployments (multi-pod behind an ingress):
+     * every pod hashed the bootstrap bundle with its own seed, so an HTML
+     * response from pod A referenced `padbootstrap-ABCD.min.js` while pod B
+     * only served `padbootstrap-WXYZ.min.js`, producing 404s on any cross-pod
+     * request (issue #7213).
      *
-     * ACHTUNG: this may prevent caching HTTP proxies to work
-     * TODO: remove the "?v=randomstring" parameter, and replace with hashed filenames instead
+     * Derive the token deterministically from the Etherpad version and
+     * whatever git SHA is available. Pods that ship the same artifact now
+     * produce the same hash, and the token still rotates per release so
+     * caches invalidate correctly.
+     *
+     * Precedence: ETHERPAD_VERSION_STRING env var (explicit integrator
+     * override) > sha256(version + "|" + gitVersion) > package.json version.
+     *
+     * For the original cache-busting rationale, see PR #3958.
      */
-    settings.randomVersionString = randomString(4);
-    logger.info(`Random string used for versioning assets: ${settings.randomVersionString}`);
+    const explicit = process.env.ETHERPAD_VERSION_STRING;
+    if (explicit) {
+        settings.randomVersionString = explicit;
+    } else {
+        const pkgVersion = require('../../package.json').version as string;
+        settings.randomVersionString = createHash('sha256')
+            .update(`${pkgVersion}|${settings.gitVersion || ''}`)
+            .digest('hex')
+            .slice(0, 8);
+    }
+    logger.info(`String used for versioning assets: ${settings.randomVersionString}`);
 };
 
 export const exportedForTestingOnly = {

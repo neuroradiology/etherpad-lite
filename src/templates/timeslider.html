@@ -1,10 +1,19 @@
 <%
   var langs = require("ep_etherpad-lite/node/hooks/i18n").availableLangs
+  var skinColors = require('ep_etherpad-lite/node/utils/SkinColors');
+  var renderLang = (req && typeof req.acceptsLanguages === 'function'
+    && req.acceptsLanguages(Object.keys(langs))) || 'en';
+  var renderDir = (langs[renderLang] && langs[renderLang].direction === 'rtl') ? 'rtl' : 'ltr';
+  var themeColor = skinColors.configuredToolbarColor(settings.skinName, settings.skinVariants);
+  // See pad.html: emit a media-scoped dark variant so iOS Safari picks the
+  // dark toolbar color at first paint on a dark-OS client (issue #7606).
+  var darkThemeColor = settings.enableDarkMode ? skinColors.darkToolbarColor(settings.skinName) : null;
 %>
 <!doctype html>
-<html translate="no" class="pad <%=settings.skinVariants%>">
+<html lang="<%=renderLang%>" dir="<%=renderDir%>" translate="no" class="pad <%=settings.skinVariants%>">
 <head>
   <title data-l10n-id="timeslider.pageTitle" data-l10n-args='{ "appTitle": "<%=settings.title%>" }'><%=settings.title%> Timeslider</title>
+<%- typeof socialMetaHtml !== 'undefined' ? socialMetaHtml : '' %>
   <script>
     /*
     |@licstart  The following is the entire license notice for the
@@ -29,11 +38,34 @@
     */
   </script>
   <meta charset="utf-8">
-  <link rel="manifest" href="../../../manifest.json" />
+  <link rel="manifest" href="../../manifest.json" />
   <meta name="robots" content="noindex, nofollow">
   <meta name="referrer" content="no-referrer">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+  <% if (themeColor) { %><meta name="theme-color" content="<%=themeColor%>"<% if (darkThemeColor) { %> media="(prefers-color-scheme: light)"<% } %>><% } %>
+  <% if (darkThemeColor) { %><meta name="theme-color" content="<%=darkThemeColor%>" media="(prefers-color-scheme: dark)"><% } %>
   <link rel="shortcut icon" href="../../favicon.ico">
+  <% if (darkThemeColor) { %>
+  <script>
+    // See pad.html: apply the dark skin classes before the stylesheet paints
+    // so dark-OS users don't see a white flash on load (issue #7606).
+    (function () {
+      try {
+        if (window.location.hash.toLowerCase() === '#skinvariantsbuilder') return;
+        if (localStorage.getItem('ep_darkMode') === 'false') return;
+        if (!(window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)) return;
+        var el = document.documentElement;
+        ['super-light', 'light', 'dark', 'super-dark'].forEach(function (c) {
+          ['editor', 'background', 'toolbar'].forEach(function (k) {
+            el.classList.remove(c + '-' + k);
+          });
+        });
+        el.classList.add('super-dark-editor', 'dark-background', 'super-dark-toolbar');
+      } catch (e) { /* localStorage/matchMedia unavailable — fall back to light */ }
+    })();
+  </script>
+  <% } %>
   <% e.begin_block("timesliderStyles"); %>
   <link rel="stylesheet" href="../../static/css/pad.css?v=<%=settings.randomVersionString%>">
   <link rel="stylesheet" href="../../static/css/iframe_editor.css?v=<%=settings.randomVersionString%>">
@@ -49,7 +81,7 @@
 </head>
 
 <% e.begin_block("timesliderBody"); %>
-<body id="padbody" class="timeslider limwidth">
+<body id="padbody" class="timeslider limwidth<% if (typeof embed !== 'undefined' && embed) { %> embedded-history-frame<% } %>">
 
   <!----------------------------->
   <!--------- TOOLBAR ----------->
@@ -110,8 +142,12 @@
     <!----------------------------->
 
     <div id="outerdocbody">
+      <div id="sidediv" class="sidediv">
+        <div id="sidedivinner" class="sidedivinner"></div>
+      </div>
       <div id="innerdocbody">
       </div>
+      <div id="linemetricsdiv">x</div>
     </div>
 
 
@@ -209,7 +245,7 @@
         <button id="forcereconnect" class="btn btn-primary" data-l10n-id="pad.modals.forcereconnect"></button>
         <% e.end_block(); %>
       </div>
-      <form id="reconnectform" method="post" action="/ep/pad/reconnect" accept-charset="UTF-8" style="display: none;">
+      <form id="reconnectform" method="post" action="<%= typeof proxyPath !== 'undefined' ? proxyPath : '' %>/ep/pad/reconnect" accept-charset="UTF-8" style="display: none;">
           <input type="hidden" class="padId" name="padId">
           <input type="hidden" class="diagnosticInfo" name="diagnosticInfo">
           <input type="hidden" class="missedChanges" name="missedChanges">
@@ -238,6 +274,20 @@
         <input type="checkbox" id="options-followContents" checked="checked">
         <label for="options-followContents" data-l10n-id="timeslider.followContents"></label>
       </p>
+      <p>
+        <label for="playbackspeed" data-l10n-id="timeslider.settings.playbackSpeed">Playback speed:</label>
+        <select id="playbackspeed">
+          <option value="100" data-l10n-id="timeslider.settings.playbackSpeed.original">Original speed</option>
+          <option value="realtime" data-l10n-id="timeslider.settings.playbackSpeed.realtime">Realtime</option>
+          <option value="200" data-l10n-id="timeslider.settings.playbackSpeed.200ms">200 ms</option>
+          <option value="500" data-l10n-id="timeslider.settings.playbackSpeed.500ms">500 ms</option>
+          <option value="1000" data-l10n-id="timeslider.settings.playbackSpeed.1000ms">1000 ms</option>
+        </select>
+      </p>
+      <p>
+        <input type="checkbox" id="options-linenoscheck">
+        <label for="options-linenoscheck" data-l10n-id="pad.settings.linenocheck"></label>
+      </p>
     </div></div>
   </div>
 </body>
@@ -255,5 +305,5 @@
 <!-- Bootstrap -->
 <script src="<%=entrypoint%>"></script>
 <% e.end_block(); %>
-<div style="display:none"><a href="/javascript" data-jslicense="1">JavaScript license information</a></div>
+<div style="display:none"><a href="<%= typeof proxyPath !== 'undefined' ? proxyPath : '' %>/javascript" data-jslicense="1">JavaScript license information</a></div>
 </html>

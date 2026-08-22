@@ -28,9 +28,30 @@ export const logger = log4js.getLogger('test');
 
 const logLevel = logger.level;
 
-// Mocha doesn't monitor unhandled Promise rejections, so convert them to uncaught exceptions.
-// https://github.com/mochajs/mocha/issues/2640
-process.on('unhandledRejection', (reason: string) => { throw reason; });
+// Log unhandled Promise rejections; do NOT rethrow and do NOT process.exit().
+//
+// Root cause of the long-standing Windows backend "silent ELIFECYCLE" flake
+// (confirmed via a procdump full-memory capture showing node::ReallyExit
+// firing from a microtask): a timing-fragile test (e.g. SessionStore touch/
+// expiry specs) gets timed out and abandoned by mocha, but its async body
+// keeps running; when its trailing assertion later throws, it surfaces as an
+// *orphan* unhandled rejection — one that belongs to no currently-awaited
+// test. PR #7663 rethrew these (→ uncaughtException) and an earlier revision
+// even called process.exit(), and server.ts's production handler turned them
+// into a full Etherpad shutdown. Any one orphan rejection therefore killed
+// the whole suite mid-run with no mocha summary.
+//
+// Orphan rejections cannot be cleanly attributed to a test, so rethrowing
+// just produces an ERR_MOCHA_MULTIPLE_DONE mess and a non-deterministic
+// abort. Log them loudly instead. Real failures are unaffected: an assertion
+// inside a test's own awaited path rejects THAT test's promise and mocha
+// fails it normally — it never reaches this global handler. The companion
+// fix is in server.ts, where the production process-exit handlers are now
+// gated on `require.main === module` so they don't fire under the test runner.
+process.on('unhandledRejection', (reason: any) => {
+  process.stderr.write(`[backend tests] unhandledRejection (logged, non-fatal): ${
+    reason && reason.stack ? reason.stack : String(reason)}\n`);
+});
 
 before(async function () {
   this.timeout(60000);
@@ -63,6 +84,22 @@ export const generateJWTTokenUser =  () => {
   jwt.setProtectedHeader({alg: 'RS256'})
   return jwt.sign(privateKeyExported!)
 }
+
+// Token whose `admin` claim is explicitly `false`. Used to pin the
+// API's JWT validation: tokens that carry the claim with a non-true
+// value must be rejected, not just tokens that omit it entirely.
+export const generateJWTTokenAdminFalse = () => {
+  const jwt = new SignJWT({
+    sub: 'admin',
+    jti: '123',
+    exp: Math.floor(Date.now() / 1000) + 60 * 60,
+    aud: 'account',
+    iss: 'http://localhost:9001',
+    admin: false,
+  });
+  jwt.setProtectedHeader({alg: 'RS256'});
+  return jwt.sign(privateKeyExported!);
+};
 
 export const init = async function () {
   if (agentPromise != null) return await agentPromise;
@@ -111,7 +148,7 @@ export const init = async function () {
  * @param {string} event - The socket.io Socket event to listen for.
  * @returns The argument(s) passed to the event handler.
  */
-export const waitForSocketEvent = async (socket: any, event:string) => {
+export const waitForSocketEvent = async (socket: any, event:string, timeoutMs = 1000) => {
   const errorEvents = [
     'error',
     'connect_error',
@@ -126,7 +163,7 @@ export const waitForSocketEvent = async (socket: any, event:string) => {
       const timeout = setTimeout(() => {
         reject(new Error(`timed out waiting for ${event} event`));
         cancelTimeout = () => {};
-      }, 1000);
+      }, timeoutMs);
       cancelTimeout = () => {
         clearTimeout(timeout);
         resolve();
@@ -185,7 +222,9 @@ export const connect = async (res:any = null) => {
     query: {cookie: reqCookieHdr, padId},
   });
   try {
-    await waitForSocketEvent(socket, 'connect');
+    // Connect is a known slow path on loaded CI runners — give it a longer budget than the
+    // default per-message wait used elsewhere.
+    await waitForSocketEvent(socket, 'connect', 5000);
   } catch (e) {
     socket.close();
     throw e;
@@ -213,7 +252,9 @@ export const handshake = async (socket: any, padId:string, token = padutils.gene
     token,
   });
   logger.debug('waiting for CLIENT_VARS response...');
-  const msg = await waitForSocketEvent(socket, 'message');
+  // CLIENT_VARS is a known slow path on loaded CI runners (auth + pad load) — give it a longer
+  // budget than the default per-message wait used elsewhere.
+  const msg = await waitForSocketEvent(socket, 'message', 5000);
   logger.debug('received CLIENT_VARS message');
   return msg;
 };

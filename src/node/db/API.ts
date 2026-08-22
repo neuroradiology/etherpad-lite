@@ -19,10 +19,16 @@
  * limitations under the License.
  */
 
+import AttributeMap from '../../static/js/AttributeMap';
 import {deserializeOps} from '../../static/js/Changeset';
 import ChatMessage from '../../static/js/ChatMessage';
 import {Builder} from "../../static/js/Builder";
 import {Attribute} from "../../static/js/types/Attribute";
+
+// Not `Pad.SYSTEM_AUTHOR_ID`: importing Pad here would be a circular load
+// (API <-> Pad) at module init time.
+import {SYSTEM_AUTHOR_ID, isSystemAuthor} from '../utils/SystemAuthor';
+import settings from '../utils/Settings';
 const CustomError = require('../utils/customError');
 const padManager = require('./PadManager');
 const padMessageHandler = require('../handler/PadMessageHandler');
@@ -30,6 +36,7 @@ import readOnlyManager from './ReadOnlyManager';
 const groupManager = require('./GroupManager');
 const authorManager = require('./AuthorManager');
 const sessionManager = require('./SessionManager');
+const padDeletionManager = require('./PadDeletionManager');
 const exportHtml = require('../utils/ExportHtml');
 const exportTxt = require('../utils/ExportTxt');
 const importHtml = require('../utils/ImportHtml');
@@ -61,6 +68,26 @@ exports.listAllPads = padManager.listAllPads;
 exports.createAuthor = authorManager.createAuthor;
 exports.createAuthorIfNotExistsFor = authorManager.createAuthorIfNotExistsFor;
 exports.getAuthorName = authorManager.getAuthorName;
+
+/**
+ * anonymizeAuthor(authorID) — GDPR Art. 17 erasure. See doc/privacy.md.
+ *
+ * Returns counters describing what was touched:
+ * {affectedPads, removedTokenMappings, removedExternalMappings,
+ *  clearedChatMessages}.
+ */
+exports.anonymizeAuthor = async (authorID: string) => {
+  if (!settings.gdprAuthorErasure || !settings.gdprAuthorErasure.enabled) {
+    throw new CustomError(
+        'anonymizeAuthor is disabled — set gdprAuthorErasure.enabled = true ' +
+        'in settings.json to enable GDPR Art. 17 erasure',
+        'apierror');
+  }
+  if (!authorID || typeof authorID !== 'string') {
+    throw new CustomError('authorID is required', 'apierror');
+  }
+  return await authorManager.anonymizeAuthor(authorID);
+};
 exports.listPadsOfAuthor = authorManager.listPadsOfAuthor;
 exports.padUsers = padMessageHandler.padUsers;
 exports.padUsersCount = padMessageHandler.padUsersCount;
@@ -387,7 +414,13 @@ exports.appendChatMessage = async (padID: string, text: string|object, authorID:
     time = Date.now();
   }
 
-  // @TODO - missing getPadSafe() call ?
+  // Reject messages addressed to a pad that doesn't exist. Without this check
+  // the downstream padManager.getPad() would create the pad on demand with
+  // default content, so the documented {code:1,"padID does not exist"} result
+  // would never be returned.
+  if (!await padManager.doesPadExists(padID)) {
+    throw new CustomError('padID does not exist', 'apierror');
+  }
 
   // save chat message to database and send message to all connected clients
   await padMessageHandler.sendChatMessageToPadClients(new ChatMessage(text, authorID, time), padID);
@@ -518,19 +551,37 @@ exports.createPad = async (padID: string, text: string, authorId = '') => {
 
   // create pad
   await getPadSafe(padID, false, text, authorId);
+  // No recovery token when it cannot help: requireAuthentication gives every
+  // creator a stable identity, and allowPadDeletionByAllUsers lets anyone delete
+  // the pad with no token at all (issue #7926). Either way the token is just an
+  // extra surface to leak.
+  const deletionToken = settings.requireAuthentication || settings.allowPadDeletionByAllUsers
+      ? null
+      : await padDeletionManager.createDeletionTokenIfAbsent(padID);
+  return {deletionToken};
 };
 
 /**
-deletePad(padID) deletes a pad
+deletePad(padID, [deletionToken]) deletes a pad
 
 Example returns:
 
 {code: 0, message:"ok", data: null}
 {code: 1, message:"padID does not exist", data: null}
+{code: 1, message:"invalid deletionToken", data: null}
  @param {String} padID the id of the pad
+ @param {String} [deletionToken] recovery token issued by createPad
 */
-exports.deletePad = async (padID: string) => {
+exports.deletePad = async (padID: string, deletionToken?: string) => {
   const pad = await getPadSafe(padID, true);
+  // apikey-authenticated callers (no deletionToken supplied) are trusted.
+  // When a caller supplies a deletionToken, it must validate unless the
+  // instance has opted everyone in via allowPadDeletionByAllUsers.
+  if (deletionToken !== undefined && deletionToken !== '' &&
+      !settings.allowPadDeletionByAllUsers &&
+      !await padDeletionManager.isValidDeletionToken(padID, deletionToken)) {
+    throw new CustomError('invalid deletionToken', 'apierror');
+  }
   await pad.remove();
 };
 
@@ -581,9 +632,28 @@ exports.restoreRevision = async (padID: string, rev: number, authorId = '') => {
   // create a new changeset with a helper builder object
   const builder = new Builder(oldText.length);
 
+  // The author to attribute inserts to. If the caller supplied an
+  // explicit authorId, that wins; otherwise fall back to the stable
+  // system author. The replayed atext was built from historical
+  // revisions that may legitimately have insert ops without an
+  // author attribute (legacy server-internal flows / .etherpad
+  // imports); appendRevision now requires every insert to carry
+  // one, so we merge the marker in below.
+  const replayAuthorId = authorId || SYSTEM_AUTHOR_ID;
+
   // assemble each line into the builder
-  eachAttribRun(atext.attribs, (start: number, end: number, attribs:Attribute[]) => {
-    builder.insert(atext.text.substring(start, end), attribs);
+  eachAttribRun(atext.attribs, (start: number, end: number, attribs:string) => {
+    // attribs here is the op.attribs *string* (the eachAttribRun
+    // callback receives it as the third arg). Use AttributeMap to
+    // merge in `author` while preserving canonical (sorted) order
+    // so checkRep doesn't reject the result. The `.set` call is a
+    // no-op when the existing attribs already contain an `author`
+    // attribute that matches; when they contain a *different*
+    // author it preserves the historical attribution (we only
+    // set author when it's missing).
+    const map = AttributeMap.fromString(attribs, pad.pool);
+    if (!map.get('author')) map.set('author', replayAuthorId);
+    builder.insert(atext.text.substring(start, end), map.toString());
   });
 
   const lastNewlinePos = oldText.lastIndexOf('\n');
@@ -636,6 +706,52 @@ exports.copyPadWithoutHistory = async (sourceID: string, destinationID: string, 
 };
 
 /**
+compactPad(padID, [keepRevisions]) collapses the pad's revision history to
+reclaim database space (issue #6194). Wraps the existing `Cleanup` helper
+so admins can trigger it over the public API / CLI rather than only
+through the admin settings UI.
+
+Gated on `settings.cleanup.enabled` so the public API can't bypass the
+same opt-in switch the admin/Cleanup path already requires.
+
+When `keepRevisions` is omitted (or `null`), all history is collapsed
+into a single base revision that reproduces the current atext
+(equivalent to a freshly-imported pad). When set to a positive integer
+N, the pad keeps only its last N revisions (equivalent to
+`cleanup.keepRevisions`). Pad text and chat history are preserved in
+both modes. Destructive — recommend exporting the `.etherpad` snapshot
+first.
+
+Example returns:
+
+{code: 0, message:"ok", data: {ok: true, mode: "all"}}
+{code: 1, message:"padID does not exist", data: null}
+{code: 1, message:"compactPad requires cleanup.enabled = true ...", data: null}
+
+ @param {String} padID the id of the pad to compact
+ @param {Number|null} keepRevisions number of recent revisions to keep;
+     null / omitted collapses the full history
+*/
+exports.compactPad = async (padID: string, keepRevisions: number | null = null) => {
+  if (!settings.cleanup.enabled) {
+    throw new CustomError(
+        'compactPad requires cleanup.enabled = true in settings.json', 'apierror');
+  }
+  const pad = await getPadSafe(padID, true);
+  const cleanup = require('../utils/Cleanup');
+  if (keepRevisions == null) {
+    await cleanup.deleteAllRevisions(pad.id);
+    return {ok: true, mode: 'all'};
+  }
+  const keep = Number(keepRevisions);
+  if (!Number.isInteger(keep) || keep < 0) {
+    throw new CustomError('keepRevisions must be a non-negative integer', 'apierror');
+  }
+  const ok = await cleanup.deleteRevisions(pad.id, keep);
+  return {ok, mode: 'keepLast', keepRevisions: keep};
+};
+
+/**
 movePad(sourceID, destinationID[, force=false]) moves a pad. If force is true,
   the destination will be overwritten if it exists.
 
@@ -650,6 +766,11 @@ Example returns:
 exports.movePad = async (sourceID: string, destinationID: string, force:boolean) => {
   const pad = await getPadSafe(sourceID, true);
   await pad.copy(destinationID, force);
+  // A move is a rename, so the pad's deletion token travels with it: the token
+  // the creator saved keeps working, and returning to the renamed pad does not
+  // hand them a second one (issue #7995). Must run before remove(), which drops
+  // the source pad's token record.
+  await padDeletionManager.transferDeletionToken(sourceID, destinationID);
   await pad.remove();
 };
 
@@ -746,7 +867,12 @@ Example returns:
 exports.listAuthorsOfPad = async (padID: string) => {
   // get the pad
   const pad = await getPadSafe(padID, true);
-  const authorIDs = pad.getAllAuthors();
+  // Pad.SYSTEM_AUTHOR_ID is the synthetic author Etherpad attributes inserts to
+  // when no authorId is supplied (HTTP API setText/appendText/setHTML without
+  // authorId, server-side import flows, plugins like ep_post_data). It is an
+  // implementation detail of changeset bookkeeping, not a real contributor, so
+  // it should not surface through this public API.
+  const authorIDs = pad.getAllAuthors().filter((id: string) => !isSystemAuthor(id));
   return {authorIDs};
 };
 
